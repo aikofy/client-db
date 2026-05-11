@@ -29,13 +29,13 @@ export function serveSnapshot(
   const originalOnMessage = transport.onMessage;
   transport.onMessage = async (peerId, msg) => {
     if (msg.type === 'snapshot-request') {
-      await _sendSnapshot(transport, adapter, peerId, msg.requestId);
+      await sendSnapshotTo(transport, adapter, peerId, msg.requestId);
     }
     originalOnMessage(peerId, msg);
   };
 }
 
-async function _sendSnapshot(
+export async function sendSnapshotTo(
   transport: WebRTCTransport,
   adapter: IStorageAdapter,
   peerId: string,

@@ -1,7 +1,6 @@
 import { IndexedDBAdapter } from './storage/indexeddb.js';
 import { WebRTCTransport } from './sync/webrtc-transport.js';
 import { GossipSync } from './sync/gossip.js';
-import { serveSnapshot } from './sync/snapshot.js';
 import type {
   DBConfig,
   Doc,
@@ -107,7 +106,6 @@ export async function createDB<C extends Record<string, CollectionSchema>>(
       syncStatus = 'syncing';
     };
 
-    serveSnapshot(transport, adapter);
     transport.connect();
     gossip.start();
 

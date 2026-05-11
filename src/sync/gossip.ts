@@ -1,11 +1,13 @@
 import { v4 as uuidv4 } from 'uuid';
 import { resolveConflict, logConflict } from '../core/conflict.js';
+import { requestSnapshot, importSnapshot, sendSnapshotTo } from './snapshot.js';
 import type {
   IStorageAdapter,
   HLCTimestamp,
   Doc,
   SyncRequestMessage,
   SyncResponseMessage,
+  PeerHelloMessage,
   SyncMessage,
   CollectionSchema,
 } from '../core/types.js';
@@ -24,6 +26,11 @@ export class GossipSync {
   private pendingRequests = new Map<string, (msg: SyncResponseMessage) => void>();
   private onlineListener: (() => void) | null = null;
 
+  // Bootstrap state
+  private peerHLCs = new Map<string, HLCTimestamp>();
+  private bootstrapped = false;
+  private bootstrapping = false;
+
   constructor(
     transport: WebRTCTransport,
     adapter: IndexedDBAdapter,
@@ -36,10 +43,18 @@ export class GossipSync {
 
   start(): void {
     this.transport.onMessage = this._handleMessage.bind(this);
+
+    // Chain onto whatever db.ts wired (e.g. syncStatus update)
+    const upstreamConnected = this.transport.onPeerConnected;
+    this.transport.onPeerConnected = (peerId) => {
+      upstreamConnected(peerId);
+      this._onPeerConnected(peerId);
+    };
+
     this.intervalId = setInterval(() => void this._gossipRound(), GOSSIP_INTERVAL_MS);
 
     if (typeof window !== 'undefined') {
-      this.onlineListener = () => void this._gossipRound();
+      this.onlineListener = () => void this._onOnline();
       window.addEventListener('online', this.onlineListener);
     }
 
@@ -77,12 +92,114 @@ export class GossipSync {
     this.transport.broadcast(message);
   }
 
+  // ─── Peer connection & bootstrap ─────────────────────────────────────────────
+
+  private _onPeerConnected(peerId: string): void {
+    const hello: PeerHelloMessage = {
+      type: 'peer-hello',
+      nodeId: this.adapter.nodeId,
+      currentHLC: this.adapter.getHLC().now(),
+    };
+    this.transport.send(peerId, hello);
+  }
+
+  private async _handlePeerHello(peerId: string, msg: PeerHelloMessage): Promise<void> {
+    this.peerHLCs.set(peerId, msg.currentHLC);
+    await this._maybeBootstrap();
+  }
+
+  /**
+   * Runs once on first peer contact. Three cases:
+   *
+   * 1. Empty DB — fetch full snapshot from the peer with the highest HLC,
+   *    then delta-sync with all remaining peers to catch anything they had.
+   *
+   * 2. Non-empty DB, never peer-synced — pre-loaded snapshot or freshly
+   *    created node: sync with ALL peers for bidirectional delta coverage.
+   *
+   * 3. Returning client — same as (2) for bootstrap; subsequent reconnects
+   *    are handled by _onOnline().
+   */
+  private async _maybeBootstrap(): Promise<void> {
+    if (this.bootstrapped || this.bootstrapping) return;
+    this.bootstrapping = true;
+
+    try {
+      const isEmpty = await this._isDBEmpty();
+
+      if (isEmpty) {
+        const bestPeer = this._findBestPeer();
+        if (!bestPeer) return; // wait for more peer-hellos before deciding
+
+        try {
+          const snapshot = await requestSnapshot(this.transport, bestPeer);
+          await importSnapshot(this.adapter, snapshot);
+        } catch {
+          // snapshot failed — fall back to delta from that peer
+          await this._syncWithPeer(bestPeer).catch(() => undefined);
+        }
+
+        // Catch any changes the best peer didn't have
+        const others = this.transport.peers().filter((p) => p !== bestPeer);
+        await Promise.allSettled(others.map((p) => this._syncWithPeer(p)));
+      } else {
+        // Pre-loaded snapshot (case 1) or first reconnect (case 3):
+        // sync all peers so no offline writes are missed
+        await this._syncAllPeers();
+      }
+
+      this.bootstrapped = true;
+    } finally {
+      this.bootstrapping = false;
+    }
+  }
+
+  private _findBestPeer(): string | null {
+    const connected = new Set(this.transport.peers());
+    let bestPeer: string | null = null;
+    let bestHLC: HLCTimestamp = '' as HLCTimestamp;
+
+    for (const [peerId, hlc] of this.peerHLCs) {
+      if (connected.has(peerId) && hlc > bestHLC) {
+        bestHLC = hlc;
+        bestPeer = peerId;
+      }
+    }
+    return bestPeer;
+  }
+
+  private async _isDBEmpty(): Promise<boolean> {
+    for (const collection of Object.keys(this.collections)) {
+      const docs = await this.adapter.query(collection, { limit: 1, includeDeleted: true });
+      if (docs.length > 0) return false;
+    }
+    return true;
+  }
+
+  // ─── Reconnect ────────────────────────────────────────────────────────────────
+
+  private async _onOnline(): Promise<void> {
+    if (this.bootstrapped) {
+      // Returning client: sync ALL peers to collect every peer's offline writes
+      await this._syncAllPeers();
+    } else {
+      void this._gossipRound();
+    }
+  }
+
+  // ─── Gossip ───────────────────────────────────────────────────────────────────
+
   private async _gossipRound(): Promise<void> {
     const peers = this.transport.peers();
     if (peers.length === 0) return;
 
     const selected = _pickRandom(peers, FANOUT);
     await Promise.allSettled(selected.map((p) => this._syncWithPeer(p)));
+  }
+
+  private async _syncAllPeers(): Promise<void> {
+    const peers = this.transport.peers();
+    await Promise.allSettled(peers.map((p) => this._syncWithPeer(p)));
   }
 
   private async _syncWithPeer(peerId: string): Promise<void> {
@@ -108,7 +225,6 @@ export class GossipSync {
         resolve(msg);
       });
 
-      // Piggyback the requestId by augmenting the message
       this.transport.send(peerId, { ...request, requestId } as SyncMessage);
     });
 
@@ -139,9 +255,13 @@ export class GossipSync {
         this.pendingRequests.delete(msg.requestId);
         handler(msg);
       } else {
-        // Unsolicited sync-response (the peer sending back our delta)
+        // Unsolicited push from a peer's broadcastDoc
         await this._applyRemoteChanges(msg.docs);
       }
+    } else if (msg.type === 'peer-hello') {
+      await this._handlePeerHello(peerId, msg);
+    } else if (msg.type === 'snapshot-request') {
+      await sendSnapshotTo(this.transport, this.adapter, peerId, msg.requestId);
     }
   }
 

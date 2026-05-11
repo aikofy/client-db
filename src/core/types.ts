@@ -168,9 +168,16 @@ export interface SnapshotResponseMessage {
   snapshot: Snapshot;
 }
 
+export interface PeerHelloMessage {
+  type: 'peer-hello';
+  nodeId: string;
+  currentHLC: HLCTimestamp;
+}
+
 export type SyncMessage =
   | SyncRequestMessage
   | SyncResponseMessage
   | SnapshotRequestMessage
   | SnapshotChunkMessage
-  | SnapshotResponseMessage;
+  | SnapshotResponseMessage
+  | PeerHelloMessage;
