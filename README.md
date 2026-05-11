@@ -10,9 +10,13 @@ A TypeScript-first, offline-ready, peer-to-peer syncing database for web browser
 ## Features
 
 - **Offline-first** — writes always succeed locally; sync happens automatically on reconnect
-- **Peer-to-peer sync** — gossip protocol over WebRTC data channels, no central database server needed
+- **Real-time peer sync** — every local write is pushed to all connected peers instantly over WebRTC data channels
+- **Room isolation** — peers only discover and sync with peers sharing the same DB name; one DB per user is safe
+- **Peer-to-peer** — gossip protocol over WebRTC, no central database server needed
 - **Hybrid Logical Clock (HLC)** — causal ordering of writes across nodes without relying on wall-clock agreement
+- **Smart bootstrap** — new peers auto-detect their state and pick the right sync strategy (snapshot, delta, or full merge)
 - **Pluggable conflict resolution** — Last-Write-Wins (default), First-Write-Wins, or a custom resolver per collection
+- **Change origin** — `onChange` callbacks receive `origin: 'local' | 'peer'` so you can distinguish your own writes from incoming sync changes
 - **Soft deletes** — tombstones preserve sync integrity; deleted records are never lost
 - **Delta sync** — only changes since last sync are exchanged, not full datasets
 - **Snapshot bootstrap** — new peers receive a full snapshot then switch to delta sync automatically
@@ -70,7 +74,10 @@ await db.todos.delete('todo-1');
 
 // React to local writes and incoming sync changes
 const unsubscribe = db.todos.onChange((changes) => {
-  console.log('changed:', changes);
+  for (const change of changes) {
+    console.log(change.origin); // 'local' | 'peer'
+    console.log(change.operation); // 'put' | 'delete'
+  }
 });
 
 // Export / import snapshots
@@ -89,13 +96,17 @@ Pass a `sync` config to enable peer-to-peer sync via WebRTC. You need a signalin
 
 The companion package [`@aikofy/client-db-sync`](https://www.npmjs.com/package/@aikofy/client-db-sync) is the ready-made signaling server for this library.
 
+### Room isolation
+
+Peers are automatically grouped by **DB name**. Only clients with the same `name` in their `createDB` config can discover and sync with each other. This makes it safe to use a userID as the DB name — each user's data stays completely isolated.
+
 ### Development (no auth)
 
 Start the signaling server with `AUTH_DISABLED=true` and connect without a token:
 
 ```typescript
 const db = await createDB({
-  name: 'myapp',
+  name: 'myapp',          // peers with name 'myapp' form one group
   version: 1,
   collections: {
     notes: { indexes: ['authorId'] },
@@ -109,10 +120,10 @@ const db = await createDB({
 
 ### Production (JWT auth)
 
-When auth is enabled on the signaling server, your backend issues a token and passes it to the client. The token is appended as a `?token=` query parameter:
+When auth is enabled on the signaling server, your backend issues a token with `subject` set to the DB name (typically the userID). The library appends the room and token automatically:
 
 ```typescript
-// 1. Your backend fetches a token from the signaling server
+// 1. Your backend issues a token scoped to this user's DB name
 const { token } = await fetch('https://signal.example.com/token', {
   method: 'POST',
   headers: {
@@ -122,9 +133,9 @@ const { token } = await fetch('https://signal.example.com/token', {
   body: JSON.stringify({ ttl: '24h', subject: currentUser.id }),
 }).then(r => r.json());
 
-// 2. Pass the token in the signalingServer URL
+// 2. Use the userID as the DB name — the library ties the room to it automatically
 const db = await createDB({
-  name: 'myapp',
+  name: currentUser.id,   // DB name = room = token subject
   version: 1,
   collections: {
     notes: { indexes: ['authorId'] },
@@ -139,18 +150,95 @@ const db = await createDB({
 });
 ```
 
+The signaling server validates that the token's `subject` matches the DB name. A token for `user-123` can **only** join room `user-123` — knowing a userID is not enough to access another user's sync group.
+
 ```typescript
 console.log(db.syncStatus); // 'online' | 'offline' | 'syncing'
 ```
 
+### What happens after connection
+
 Once connected, the library:
-1. Discovers peers via the signaling server
-2. Opens RTCDataChannel connections with up to K=3 random peers (gossip fanout)
-3. Exchanges only records changed since the last sync (`HLCTimestamp`)
-4. Re-gossips every 30 seconds and immediately on `window.online`
-5. Bootstraps new peers with a full snapshot, then switches to delta sync
+
+1. Exchanges `peer-hello` messages with each connected peer (advertises current HLC watermark)
+2. Picks the right bootstrap strategy based on local state (see below)
+3. Pushes every local write to all connected peers **immediately** via RTCDataChannel (~20–100ms)
+4. Re-gossips every 30 seconds as a catch-up heartbeat
+5. On `window.online`, syncs with **all** connected peers to collect any offline writes
 
 > **Note:** The signaling server is only used for WebRTC handshake (offer/answer/ICE candidates). After connection, all data flows directly peer-to-peer.
+
+---
+
+## Bootstrap Strategies
+
+When a client connects to peers for the first time in a session, it automatically picks the right strategy:
+
+### Case 1 — Pre-loaded snapshot (`initialSnapshot`)
+
+You passed `initialSnapshot` to `sync`. The library awaits the promise (e.g. a Drive download), imports the snapshot into an empty DB, **then** connects to peers. After connecting it syncs bidirectionally with **all** peers from the snapshot's HLC watermark, catching any writes that happened since the snapshot was taken.
+
+If the promise rejects or resolves to `null`, the library skips the import and falls through to Case 2.
+
+### Case 2 — Completely new client (empty DB)
+
+The library waits briefly (300ms) to collect `peer-hello` responses from all initially-connected peers, then picks the **most up-to-date peer** (highest HLC) and requests their full snapshot. After applying it, it delta-syncs with all remaining peers to catch anything that peer didn't have.
+
+### Case 3 — Returning client (offline data)
+
+The client has existing local data from a previous session. On reconnect, it syncs bidirectionally with **all** connected peers — not just a random subset — so every peer's offline writes are collected without loss.
+
+---
+
+## Cloud Snapshot Seeding
+
+Use `initialSnapshot` to seed a new browser from a cloud-stored snapshot (Google Drive, S3, etc.) before connecting to any peers. This avoids a slow full-snapshot bootstrap from a peer.
+
+```typescript
+// Download snapshot from your cloud storage
+async function loadSnapshotFromDrive(): Promise<Snapshot | null> {
+  try {
+    const res = await fetch('https://storage.example.com/snapshots/user-123.json');
+    if (!res.ok) return null;
+    return res.json() as Promise<Snapshot>;
+  } catch {
+    return null;
+  }
+}
+
+const db = await createDB({
+  name: currentUser.id,
+  version: 1,
+  collections: { todos: { indexes: ['status'] } },
+  sync: {
+    signalingServer: `wss://signal.example.com/signal?token=${token}`,
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    // Peers are not contacted until this promise settles
+    initialSnapshot: loadSnapshotFromDrive(),
+  },
+});
+```
+
+**What happens:**
+
+| Scenario | Result |
+|----------|--------|
+| Drive download succeeds | Snapshot imported → peers connect → delta sync from snapshot watermark (fast) |
+| Drive download fails / returns `null` | No import → peers connect → full snapshot fetched from best peer (Case 2) |
+| DB already has local data | `initialSnapshot` is ignored (won't overwrite existing data) |
+
+To keep the cloud snapshot fresh, call `db.export()` and upload the result periodically or on `window.beforeunload`.
+
+```typescript
+// Save snapshot to your cloud storage on page unload
+window.addEventListener('beforeunload', async () => {
+  const snapshot = await db.export();
+  navigator.sendBeacon(
+    'https://storage.example.com/snapshots/user-123.json',
+    JSON.stringify(snapshot),
+  );
+});
+```
 
 ---
 
@@ -168,7 +256,7 @@ Returns a `TypedDB<C>` — an object where each key of `collections` is a `Colle
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `name` | `string` | IndexedDB database name |
+| `name` | `string` | IndexedDB database name. Also used as the sync room — peers with the same name sync together. |
 | `version` | `number` | Schema version — increment to trigger migrations |
 | `collections` | `Record<string, CollectionSchema>` | Collection definitions |
 | `sync` | `SyncConfig` (optional) | Enable WebRTC sync |
@@ -184,9 +272,10 @@ Returns a `TypedDB<C>` — an object where each key of `collections` is a `Colle
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `signalingServer` | `string` | WebSocket URL of the signaling server. Append `?token=<jwt>` when auth is enabled on `@aikofy/client-db-sync`. Use plain `ws://` without a token when `AUTH_DISABLED=true`. |
+| `signalingServer` | `string` | WebSocket URL. Append `?token=<jwt>` when auth is enabled. The `room` param is appended automatically from `DBConfig.name`. |
 | `iceServers` | `IceServer[]` | STUN/TURN servers for WebRTC |
 | `nodeId` | `string` (optional) | Override auto-generated node UUID |
+| `initialSnapshot` | `Snapshot \| Promise<Snapshot \| null \| undefined>` (optional) | Seed the DB before connecting to peers. Peer connections are held until this settles. See [Cloud snapshot seeding](#cloud-snapshot-seeding). |
 
 ---
 
@@ -201,7 +290,7 @@ const saved = await db.todos.put({ _id: 'abc', title: 'Hello', status: 'open' })
 // _id is auto-generated (UUID) if omitted
 ```
 
-Upserts a record. Stamps `_rev` (HLC), `_updatedAt` (HLC), `_deleted: false`. Returns the full `Doc<T>`.
+Upserts a record. Stamps `_rev` (HLC), `_updatedAt` (HLC), `_deleted: false`. Returns the full `Doc<T>`. The write is immediately pushed to all connected peers.
 
 #### `get(id)`
 
@@ -224,13 +313,18 @@ const results = await db.todos.query({
 
 #### `delete(id)`
 
-Soft delete — sets `_deleted: true` with a new HLC revision. The record remains in IndexedDB and is synced as a deletion event to peers.
+Soft delete — sets `_deleted: true` with a new HLC revision. The record remains in IndexedDB and is synced as a deletion event to peers immediately.
 
 #### `onChange(callback)`
 
 ```typescript
 const unsubscribe = db.todos.onChange((changes: ChangeEntry[]) => {
-  // fires on local writes AND incoming sync changes
+  // fires on local writes AND incoming sync changes from peers
+  for (const change of changes) {
+    console.log(change.origin);    // 'local' | 'peer'
+    console.log(change.operation); // 'put' | 'delete'
+    console.log(change.id);        // document _id
+  }
 });
 
 unsubscribe(); // stop listening
@@ -250,6 +344,21 @@ Every stored document has these read-only system fields:
 | `_updatedAt` | `HLCTimestamp` | Last write timestamp (HLC) |
 
 `HLCTimestamp` strings are lexicographically sortable — alphabetical order equals causal order.
+
+---
+
+### `ChangeEntry`
+
+Passed to `onChange` callbacks:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `string` | Document `_id` |
+| `collection` | `string` | Collection name |
+| `_rev` | `HLCTimestamp` | Revision at time of change |
+| `_updatedAt` | `HLCTimestamp` | Timestamp of change |
+| `operation` | `'put' \| 'delete'` | Type of write |
+| `origin` | `'local' \| 'peer'` | Who made the change |
 
 ---
 
@@ -284,7 +393,7 @@ All conflicts (both versions + resolved) are logged to an internal `_conflicts` 
 // Export full snapshot (all collections + HLC watermark)
 const snapshot = await db.export();
 
-// Import snapshot and resume delta sync from its HLC
+// Import snapshot — use before connecting sync to seed a new client
 await db.import(snapshot);
 ```
 
@@ -342,8 +451,9 @@ const collections = {
 };
 
 // Fetch a short-lived token from your own backend (which calls @aikofy/client-db-sync's POST /token).
+// The token's subject must equal the DB name (userId).
 // In dev, skip this and use AUTH_DISABLED=true on the signaling server.
-async function fetchSignalToken(): Promise<string> {
+async function fetchSignalToken(userId: string): Promise<string> {
   const res = await fetch('/api/signal-token', { method: 'POST' });
   const { token } = await res.json() as { token: string };
   return token;
@@ -351,15 +461,15 @@ async function fetchSignalToken(): Promise<string> {
 
 let dbInstance: TypedDB<typeof collections> | null = null;
 
-async function getDB() {
+async function getDB(userId: string) {
   if (!dbInstance) {
     const isDev = import.meta.env.DEV; // Vite / any bundler dev flag
     const signalingServer = isDev
       ? 'ws://localhost:8080/signal'
-      : `wss://signal.example.com/signal?token=${await fetchSignalToken()}`;
+      : `wss://signal.example.com/signal?token=${await fetchSignalToken(userId)}`;
 
     dbInstance = await createDB({
-      name: 'myapp',
+      name: userId,   // DB name = room — only this user's peers sync together
       version: 1,
       collections,
       sync: {
@@ -371,20 +481,20 @@ async function getDB() {
   return dbInstance;
 }
 
-function useTodos() {
+function useTodos(userId: string) {
   const [todos, setTodos] = useState([]);
 
   useEffect(() => {
     let unsubscribe: (() => void) | undefined;
 
-    getDB().then((db) => {
+    getDB(userId).then((db) => {
       const load = () => db.todos.query({ orderBy: '_updatedAt', orderDir: 'desc' }).then(setTodos);
       load();
       unsubscribe = db.todos.onChange(() => load());
     });
 
     return () => unsubscribe?.();
-  }, []);
+  }, [userId]);
 
   return todos;
 }
@@ -417,8 +527,8 @@ src/
     schema.ts         # Collection schema builder
     indexeddb.ts      # IndexedDB implementation of IStorageAdapter
   sync/
-    webrtc-transport.ts  # WebRTC + WebSocket signaling
-    gossip.ts            # Gossip sync protocol (K=3 fanout, 30s interval)
+    webrtc-transport.ts  # WebRTC + WebSocket signaling (room-aware)
+    gossip.ts            # Gossip sync protocol (K=3 fanout, 30s interval, real-time push)
     snapshot.ts          # Snapshot export / import / chunking
   db.ts               # createDB() factory + CollectionProxy
   index.ts            # Public exports

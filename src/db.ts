@@ -4,6 +4,7 @@ import { GossipSync } from './sync/gossip.js';
 import type {
   DBConfig,
   Doc,
+  HLCTimestamp,
   QueryOptions,
   Snapshot,
   ChangeEntry,
@@ -106,6 +107,18 @@ export async function createDB<C extends Record<string, CollectionSchema>>(
     transport.onPeerConnected = () => {
       syncStatus = 'syncing';
     };
+
+    if (config.sync.initialSnapshot !== undefined) {
+      try {
+        const snapshot = await Promise.resolve(config.sync.initialSnapshot);
+        if (snapshot) {
+          const existing = await adapter.changes('0' as HLCTimestamp);
+          if (existing.length === 0) await adapter.import(snapshot);
+        }
+      } catch {
+        // Drive error — connect with empty DB, bootstrap from best peer (Case 2)
+      }
+    }
 
     transport.connect();
     gossip.start();

@@ -77,6 +77,14 @@ export interface SyncConfig {
   signalingServer: string;
   iceServers: IceServer[];
   nodeId?: string;
+  /**
+   * Seed the DB before connecting to any peers.
+   * Pass a Promise that resolves to a Snapshot (e.g. downloaded from Drive).
+   * - Resolves with Snapshot → imported, then peers connect → delta sync (Case 1)
+   * - Resolves with null/undefined or rejects → peers connect → full bootstrap from best peer (Case 2)
+   * Peer connections are delayed until the promise settles.
+   */
+  initialSnapshot?: Snapshot | Promise<Snapshot | null | undefined>;
 }
 
 // ─── DB config ────────────────────────────────────────────────────────────────

@@ -234,9 +234,22 @@ export class IndexedDBAdapter implements IStorageAdapter {
 
   async bulkInsert(collection: string, docs: Doc[]): Promise<void> {
     if (docs.length === 0) return;
-    const tx = this.db.transaction(collection, 'readwrite');
+    const tx = this.db.transaction([collection, CHANGES_STORE], 'readwrite');
     const store = tx.objectStore(collection);
-    await Promise.all(docs.map((d) => store.put(d)));
+    const changesStore = tx.objectStore(CHANGES_STORE);
+    await Promise.all(
+      docs.map((d) => {
+        const entry: ChangeEntry = {
+          id: d._id,
+          collection,
+          _rev: d._rev,
+          _updatedAt: d._updatedAt,
+          operation: d._deleted ? 'delete' : 'put',
+          origin: 'peer',
+        };
+        return Promise.all([store.put(d), changesStore.put(entry)]);
+      }),
+    );
     await tx.done;
     for (const doc of docs) {
       this._emitChange({
