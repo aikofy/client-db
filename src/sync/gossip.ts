@@ -17,6 +17,9 @@ import type { IndexedDBAdapter } from '../storage/indexeddb.js';
 const GOSSIP_INTERVAL_MS = 30_000;
 const FANOUT = 3;
 const META_PEER_SYNC_PREFIX = 'lastSync:';
+// Wait this long after first peer-hello before picking the "best" peer for bootstrap,
+// so we have time to collect hellos from all initially-connected peers.
+const BOOTSTRAP_DELAY_MS = 300;
 
 export class GossipSync {
   private transport: WebRTCTransport;
@@ -30,6 +33,9 @@ export class GossipSync {
   private peerHLCs = new Map<string, HLCTimestamp>();
   private bootstrapped = false;
   private bootstrapping = false;
+  private bootstrapTimer: ReturnType<typeof setTimeout> | null = null;
+  // Fix A: broadcasts that arrived while snapshot was being imported
+  private pendingBroadcasts: Doc[][] = [];
 
   constructor(
     transport: WebRTCTransport,
@@ -64,9 +70,11 @@ export class GossipSync {
 
   stop(): void {
     if (this.intervalId) clearInterval(this.intervalId);
+    if (this.bootstrapTimer) clearTimeout(this.bootstrapTimer);
     if (this.onlineListener && typeof window !== 'undefined') {
       window.removeEventListener('online', this.onlineListener);
     }
+    this.pendingBroadcasts = [];
   }
 
   /** Push a single doc to all connected peers immediately (no round-trip). */
@@ -105,11 +113,26 @@ export class GossipSync {
 
   private async _handlePeerHello(peerId: string, msg: PeerHelloMessage): Promise<void> {
     this.peerHLCs.set(peerId, msg.currentHLC);
-    await this._maybeBootstrap();
+
+    if (this.bootstrapped) {
+      // Fix E: post-bootstrap peer arrived — sync if they have data we don't
+      const myHLC = this.adapter.getHLC().now();
+      if (msg.currentHLC > myHLC) {
+        await this._syncWithPeer(peerId).catch(() => undefined);
+      }
+      // If their HLC ≤ ours they will bootstrap from us via their own _maybeBootstrap
+      return;
+    }
+
+    if (this.bootstrapping) return;
+
+    // Fix B: debounce — collect peer-hellos for BOOTSTRAP_DELAY_MS before picking the best peer
+    if (this.bootstrapTimer) clearTimeout(this.bootstrapTimer);
+    this.bootstrapTimer = setTimeout(() => void this._maybeBootstrap(), BOOTSTRAP_DELAY_MS);
   }
 
   /**
-   * Runs once on first peer contact. Three cases:
+   * Runs once per session on first peer contact. Three cases:
    *
    * 1. Empty DB — fetch full snapshot from the peer with the highest HLC,
    *    then delta-sync with all remaining peers to catch anything they had.
@@ -117,8 +140,8 @@ export class GossipSync {
    * 2. Non-empty DB, never peer-synced — pre-loaded snapshot or freshly
    *    created node: sync with ALL peers for bidirectional delta coverage.
    *
-   * 3. Returning client — same as (2) for bootstrap; subsequent reconnects
-   *    are handled by _onOnline().
+   * 3. Returning client — same as (2) for the initial bootstrap; subsequent
+   *    reconnects are handled by _onOnline().
    */
   private async _maybeBootstrap(): Promise<void> {
     if (this.bootstrapped || this.bootstrapping) return;
@@ -129,13 +152,17 @@ export class GossipSync {
 
       if (isEmpty) {
         const bestPeer = this._findBestPeer();
-        if (!bestPeer) return; // wait for more peer-hellos before deciding
+        if (!bestPeer) {
+          // No peers with known HLC yet — re-arm the timer so we retry when more arrive
+          this.bootstrapTimer = setTimeout(() => void this._maybeBootstrap(), BOOTSTRAP_DELAY_MS);
+          return;
+        }
 
         try {
           const snapshot = await requestSnapshot(this.transport, bestPeer);
           await importSnapshot(this.adapter, snapshot);
         } catch {
-          // snapshot failed — fall back to delta from that peer
+          // snapshot failed — fall back to full delta from that peer
           await this._syncWithPeer(bestPeer).catch(() => undefined);
         }
 
@@ -143,10 +170,16 @@ export class GossipSync {
         const others = this.transport.peers().filter((p) => p !== bestPeer);
         await Promise.allSettled(others.map((p) => this._syncWithPeer(p)));
       } else {
-        // Pre-loaded snapshot (case 1) or first reconnect (case 3):
+        // Pre-loaded snapshot (case 1) or returning client (case 3):
         // sync all peers so no offline writes are missed
         await this._syncAllPeers();
       }
+
+      // Fix A: drain broadcasts that arrived while the snapshot was being imported
+      for (const docs of this.pendingBroadcasts) {
+        await this._applyRemoteChanges(docs);
+      }
+      this.pendingBroadcasts = [];
 
       this.bootstrapped = true;
     } finally {
@@ -255,8 +288,12 @@ export class GossipSync {
         this.pendingRequests.delete(msg.requestId);
         handler(msg);
       } else {
-        // Unsolicited push from a peer's broadcastDoc
-        await this._applyRemoteChanges(msg.docs);
+        // Fix A: unsolicited broadcast — buffer during bootstrap to avoid snapshot overwrite race
+        if (this.bootstrapping) {
+          this.pendingBroadcasts.push(msg.docs);
+        } else {
+          await this._applyRemoteChanges(msg.docs);
+        }
       }
     } else if (msg.type === 'peer-hello') {
       await this._handlePeerHello(peerId, msg);

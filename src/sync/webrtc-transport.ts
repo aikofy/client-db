@@ -4,6 +4,7 @@ export interface WebRTCTransportConfig {
   signalingServerUrl: string;
   iceServers: RTCIceServer[];
   nodeId: string;
+  room: string;
 }
 
 type PeerEventHandler = (peerId: string) => void;
@@ -43,7 +44,8 @@ export class WebRTCTransport {
     if (this.stopped) return;
 
     try {
-      this.ws = new WebSocket(this.config.signalingServerUrl);
+      const url = _appendRoomParam(this.config.signalingServerUrl, this.config.room);
+      this.ws = new WebSocket(url);
     } catch {
       this._scheduleReconnect();
       return;
@@ -266,4 +268,9 @@ export class WebRTCTransport {
       this._removePeer(peerId);
     }
   }
+}
+
+function _appendRoomParam(url: string, room: string): string {
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}room=${encodeURIComponent(room)}`;
 }

@@ -94,6 +94,7 @@ export async function createDB<C extends Record<string, CollectionSchema>>(
       signalingServerUrl: config.sync.signalingServer,
       iceServers: config.sync.iceServers,
       nodeId: config.sync.nodeId ?? nodeId,
+      room: config.name,
     });
 
     gossip = new GossipSync(
