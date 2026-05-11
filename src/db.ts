@@ -78,7 +78,11 @@ export async function createDB<C extends Record<string, CollectionSchema>>(
     if (cbs && cbs.size > 0) {
       for (const cb of cbs) cb([entry]);
     }
-    gossip?.syncNow();
+    if (gossip) {
+      void adapter.get(entry.collection, entry.id).then((doc) => {
+        if (doc) gossip!.broadcastDoc(entry.collection, doc);
+      });
+    }
   });
 
   let transport: WebRTCTransport | null = null;

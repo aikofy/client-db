@@ -139,6 +139,7 @@ export class IndexedDBAdapter implements IStorageAdapter {
       _rev: rev,
       _updatedAt: rev,
       operation: 'put',
+      origin: 'local',
     };
 
     const tx = this.db.transaction([collection, CHANGES_STORE], 'readwrite');
@@ -219,6 +220,7 @@ export class IndexedDBAdapter implements IStorageAdapter {
       _rev: rev,
       _updatedAt: rev,
       operation: 'delete',
+      origin: 'local',
     };
 
     const tx = this.db.transaction([collection, CHANGES_STORE], 'readwrite');
@@ -236,6 +238,16 @@ export class IndexedDBAdapter implements IStorageAdapter {
     const store = tx.objectStore(collection);
     await Promise.all(docs.map((d) => store.put(d)));
     await tx.done;
+    for (const doc of docs) {
+      this._emitChange({
+        id: doc._id,
+        collection,
+        _rev: doc._rev,
+        _updatedAt: doc._updatedAt,
+        operation: doc._deleted ? 'delete' : 'put',
+        origin: 'peer',
+      });
+    }
   }
 
   async changes(since: HLCTimestamp): Promise<ChangeEntry[]> {

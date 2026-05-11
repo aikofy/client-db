@@ -40,6 +40,8 @@ export interface ChangeEntry {
   _rev: HLCTimestamp;
   _updatedAt: HLCTimestamp;
   operation: ChangeOperation;
+  /** 'local' = written by this node; 'peer' = received from a remote peer */
+  origin: 'local' | 'peer';
 }
 
 // ─── Conflict resolution ──────────────────────────────────────────────────────

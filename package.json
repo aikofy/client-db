@@ -1,6 +1,6 @@
 {
   "name": "@aikofy/client-db",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "IndexedDB sync wrapper with HLC, conflict resolution, and WebRTC gossip sync",
   "type": "module",
   "main": "./dist/index.cjs",

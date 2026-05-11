@@ -54,9 +54,27 @@ export class GossipSync {
     }
   }
 
-  /** Trigger an immediate gossip round to all connected peers. */
-  syncNow(): void {
-    void this._gossipRound();
+  /** Push a single doc to all connected peers immediately (no round-trip). */
+  broadcastDoc(collection: string, doc: Doc): void {
+    const peers = this.transport.peers();
+    if (peers.length === 0) return;
+
+    const message: SyncResponseMessage = {
+      type: 'sync-response',
+      changes: [{
+        id: doc._id,
+        collection,
+        _rev: doc._rev,
+        _updatedAt: doc._updatedAt,
+        operation: doc._deleted ? 'delete' : 'put',
+        origin: 'local' as const,
+      }],
+      docs: [{ ...doc, _collection: collection } as Doc & { _collection: string }],
+      fromNodeId: this.adapter.nodeId,
+      requestId: uuidv4(),
+    };
+
+    this.transport.broadcast(message);
   }
 
   private async _gossipRound(): Promise<void> {
