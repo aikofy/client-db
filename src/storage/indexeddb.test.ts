@@ -14,7 +14,6 @@ describe('IndexedDBAdapter', () => {
 
   beforeEach(async () => {
     // Fresh IDB factory per test to avoid cross-test pollution
-    // @ts-expect-error -- patching global
     globalThis.indexedDB = new IDBFactory();
     adapter = makeAdapter(`db-${Math.random()}`);
     await adapter.open();

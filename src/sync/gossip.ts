@@ -54,6 +54,11 @@ export class GossipSync {
     }
   }
 
+  /** Trigger an immediate gossip round to all connected peers. */
+  syncNow(): void {
+    void this._gossipRound();
+  }
+
   private async _gossipRound(): Promise<void> {
     const peers = this.transport.peers();
     if (peers.length === 0) return;
