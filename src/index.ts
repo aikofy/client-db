@@ -27,6 +27,9 @@ export type {
   SnapshotRequestMessage,
   SnapshotChunkMessage,
   SnapshotResponseMessage,
+  SnapshotStreamStartMessage,
+  SnapshotStreamBatchMessage,
+  SnapshotStreamEndMessage,
 } from './core/types.js';
 
 export { resolveConflict, logConflict } from './core/conflict.js';
@@ -34,4 +37,12 @@ export { IndexedDBAdapter } from './storage/indexeddb.js';
 export { WebRTCTransport } from './sync/webrtc-transport.js';
 export type { WebRTCTransportConfig } from './sync/webrtc-transport.js';
 export { GossipSync } from './sync/gossip.js';
-export { exportSnapshot, importSnapshot, requestSnapshot, serveSnapshot } from './sync/snapshot.js';
+export {
+  exportSnapshot,
+  importSnapshot,
+  requestSnapshot,
+  sendSnapshotTo,
+  handleSnapshotStreamStart,
+  handleSnapshotStreamBatch,
+  handleSnapshotStreamEnd,
+} from './sync/snapshot.js';

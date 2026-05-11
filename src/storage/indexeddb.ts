@@ -14,6 +14,7 @@ import type {
 } from '../core/types.js';
 
 const META_STORE = '_meta';
+const BULK_INSERT_BATCH_SIZE = 1000;
 const CONFLICTS_STORE = '_conflicts';
 const SYSTEM_STORES = [CHANGES_STORE, META_STORE, CONFLICTS_STORE];
 
@@ -21,7 +22,7 @@ export class IndexedDBAdapter implements IStorageAdapter {
   private db!: IDBPDatabase;
   private hlc!: HLC;
   private readonly dbName: string;
-  private readonly version: number;
+  readonly version: number;
   private readonly collections: Record<string, CollectionSchema>;
   private changeListeners: Array<(entry: ChangeEntry) => void> = [];
 
@@ -99,6 +100,10 @@ export class IndexedDBAdapter implements IStorageAdapter {
   }
 
   private async _persistHLC(): Promise<void> {
+    await this.persistHLC();
+  }
+
+  async persistHLC(): Promise<void> {
     const tx = this.db.transaction(META_STORE, 'readwrite');
     await tx.store.put({ key: 'hlc', value: this.hlc.now() });
     await tx.done;
@@ -157,6 +162,38 @@ export class IndexedDBAdapter implements IStorageAdapter {
     return (record as Doc | undefined) ?? null;
   }
 
+  private _matchesWhere(record: Doc, where?: QueryOptions['where']): boolean {
+    if (!where) return true;
+    for (const [k, v] of Object.entries(where)) {
+      if (k === '_updatedAt') continue;
+      if ((record as Record<string, unknown>)[k] !== v) return false;
+    }
+    return true;
+  }
+
+  private async _queryCursor(collection: string, options: QueryOptions): Promise<Doc[]> {
+    const { where, limit, offset = 0, includeDeleted = false } = options;
+    const tx = this.db.transaction(collection, 'readonly');
+    const results: Doc[] = [];
+    let skipped = 0;
+
+    let cursor = await tx.objectStore(collection).openCursor();
+    while (cursor) {
+      const record = cursor.value as Doc;
+      if ((includeDeleted || !record._deleted) && this._matchesWhere(record, where)) {
+        if (skipped < offset) {
+          skipped++;
+        } else {
+          results.push(record);
+          if (results.length >= (limit ?? Infinity)) break;
+        }
+      }
+      cursor = await cursor.continue();
+    }
+    await tx.done;
+    return results;
+  }
+
   async query(collection: string, options: QueryOptions = {}): Promise<Doc[]> {
     const {
       where,
@@ -166,6 +203,11 @@ export class IndexedDBAdapter implements IStorageAdapter {
       offset = 0,
       includeDeleted = false,
     } = options;
+
+    // Fast path: early-exit cursor when limit is set and no sort needed
+    if (limit !== undefined && !orderBy) {
+      return this._queryCursor(collection, options);
+    }
 
     let records: Doc[];
 
@@ -185,13 +227,7 @@ export class IndexedDBAdapter implements IStorageAdapter {
     }
 
     if (where) {
-      records = records.filter((r) => {
-        for (const [k, v] of Object.entries(where)) {
-          if (k === '_updatedAt') continue;
-          if ((r as Record<string, unknown>)[k] !== v) return false;
-        }
-        return true;
-      });
+      records = records.filter((r) => this._matchesWhere(r, where));
     }
 
     if (orderBy) {
@@ -203,8 +239,7 @@ export class IndexedDBAdapter implements IStorageAdapter {
       });
     }
 
-    const sliced = records.slice(offset, limit !== undefined ? offset + limit : undefined);
-    return sliced;
+    return records.slice(offset, limit !== undefined ? offset + limit : undefined);
   }
 
   async delete(collection: string, id: string): Promise<void> {
@@ -234,40 +269,45 @@ export class IndexedDBAdapter implements IStorageAdapter {
 
   async bulkInsert(collection: string, docs: Doc[]): Promise<void> {
     if (docs.length === 0) return;
-    const tx = this.db.transaction([collection, CHANGES_STORE], 'readwrite');
-    const store = tx.objectStore(collection);
-    const changesStore = tx.objectStore(CHANGES_STORE);
-    await Promise.all(
-      docs.map((d) => {
-        const entry: ChangeEntry = {
-          id: d._id,
+    for (let start = 0; start < docs.length; start += BULK_INSERT_BATCH_SIZE) {
+      const batch = docs.slice(start, start + BULK_INSERT_BATCH_SIZE);
+      const tx = this.db.transaction([collection, CHANGES_STORE], 'readwrite');
+      const store = tx.objectStore(collection);
+      const changesStore = tx.objectStore(CHANGES_STORE);
+      await Promise.all(
+        batch.map((d) => {
+          const entry: ChangeEntry = {
+            id: d._id,
+            collection,
+            _rev: d._rev,
+            _updatedAt: d._updatedAt,
+            operation: d._deleted ? 'delete' : 'put',
+            origin: 'peer',
+          };
+          return Promise.all([store.put(d), changesStore.put(entry)]);
+        }),
+      );
+      await tx.done;
+      for (const doc of batch) {
+        this._emitChange({
+          id: doc._id,
           collection,
-          _rev: d._rev,
-          _updatedAt: d._updatedAt,
-          operation: d._deleted ? 'delete' : 'put',
+          _rev: doc._rev,
+          _updatedAt: doc._updatedAt,
+          operation: doc._deleted ? 'delete' : 'put',
           origin: 'peer',
-        };
-        return Promise.all([store.put(d), changesStore.put(entry)]);
-      }),
-    );
-    await tx.done;
-    for (const doc of docs) {
-      this._emitChange({
-        id: doc._id,
-        collection,
-        _rev: doc._rev,
-        _updatedAt: doc._updatedAt,
-        operation: doc._deleted ? 'delete' : 'put',
-        origin: 'peer',
-      });
+        });
+      }
     }
   }
 
-  async changes(since: HLCTimestamp): Promise<ChangeEntry[]> {
+  async changes(since: HLCTimestamp, limit?: number): Promise<ChangeEntry[]> {
     const tx = this.db.transaction(CHANGES_STORE, 'readonly');
     const index = tx.objectStore(CHANGES_STORE).index('_updatedAt');
     const range = IDBKeyRange.lowerBound(since, true);
-    const results = await index.getAll(range);
+    const results = limit !== undefined
+      ? await index.getAll(range, limit)
+      : await index.getAll(range);
     await tx.done;
     return results as ChangeEntry[];
   }

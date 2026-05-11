@@ -18,6 +18,8 @@ interface PeerState {
 
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
+const BACKPRESSURE_HIGH_WATER = 16 * 1024 * 1024; // 16 MB
+const BACKPRESSURE_LOW_WATER = 1 * 1024 * 1024;   //  1 MB
 
 export class WebRTCTransport {
   private config: WebRTCTransportConfig;
@@ -198,6 +200,7 @@ export class WebRTCTransport {
   ): void {
     channel.onopen = () => {
       state.channelOpen = true;
+      channel.bufferedAmountLowThreshold = BACKPRESSURE_LOW_WATER;
       this.onPeerConnected(peerId);
 
       const queued = this.pendingMessages.get(peerId);
@@ -236,6 +239,26 @@ export class WebRTCTransport {
 
   private _sendOnChannel(channel: RTCDataChannel, message: SyncMessage): void {
     channel.send(JSON.stringify(message));
+  }
+
+  async sendAsync(peerId: string, message: SyncMessage): Promise<void> {
+    const state = this.peerStates.get(peerId);
+    if (!state?.channelOpen || !state.channel) {
+      this.send(peerId, message);
+      return;
+    }
+    const channel = state.channel;
+    if (channel.bufferedAmount > BACKPRESSURE_HIGH_WATER) {
+      await new Promise<void>((resolve) => {
+        channel.bufferedAmountLowThreshold = BACKPRESSURE_LOW_WATER;
+        const handler = () => {
+          channel.removeEventListener('bufferedamountlow', handler);
+          resolve();
+        };
+        channel.addEventListener('bufferedamountlow', handler);
+      });
+    }
+    this._sendOnChannel(channel, message);
   }
 
   send(peerId: string, message: SyncMessage): void {

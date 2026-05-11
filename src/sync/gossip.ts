@@ -1,6 +1,12 @@
 import { v4 as uuidv4 } from 'uuid';
 import { resolveConflict, logConflict } from '../core/conflict.js';
-import { requestSnapshot, importSnapshot, sendSnapshotTo } from './snapshot.js';
+import {
+  requestSnapshot,
+  sendSnapshotTo,
+  handleSnapshotStreamStart,
+  handleSnapshotStreamBatch,
+  handleSnapshotStreamEnd,
+} from './snapshot.js';
 import type {
   IStorageAdapter,
   HLCTimestamp,
@@ -10,6 +16,9 @@ import type {
   PeerHelloMessage,
   SyncMessage,
   CollectionSchema,
+  SnapshotStreamStartMessage,
+  SnapshotStreamBatchMessage,
+  SnapshotStreamEndMessage,
 } from '../core/types.js';
 import type { WebRTCTransport } from './webrtc-transport.js';
 import type { IndexedDBAdapter } from '../storage/indexeddb.js';
@@ -17,6 +26,7 @@ import type { IndexedDBAdapter } from '../storage/indexeddb.js';
 const GOSSIP_INTERVAL_MS = 30_000;
 const FANOUT = 3;
 const META_PEER_SYNC_PREFIX = 'lastSync:';
+const SYNC_PAGE_SIZE = 500;
 // Wait this long after first peer-hello before picking the "best" peer for bootstrap,
 // so we have time to collect hellos from all initially-connected peers.
 const BOOTSTRAP_DELAY_MS = 300;
@@ -159,8 +169,7 @@ export class GossipSync {
         }
 
         try {
-          const snapshot = await requestSnapshot(this.transport, bestPeer);
-          await importSnapshot(this.adapter, snapshot);
+          await requestSnapshot(this.transport, bestPeer, this.adapter);
         } catch {
           // snapshot failed — fall back to full delta from that peer
           await this._syncWithPeer(bestPeer).catch(() => undefined);
@@ -235,19 +244,13 @@ export class GossipSync {
     await Promise.allSettled(peers.map((p) => this._syncWithPeer(p)));
   }
 
-  private async _syncWithPeer(peerId: string): Promise<void> {
-    const since = await this._getLastSyncHLC(peerId);
-    const requestId = uuidv4();
-    const nodeId = this.adapter.nodeId;
-
-    const request: SyncRequestMessage = {
-      type: 'sync-request',
-      since,
-      collections: Object.keys(this.collections),
-      fromNodeId: nodeId,
-    };
-
-    const response = await new Promise<SyncResponseMessage>((resolve, reject) => {
+  private async _requestPage(
+    peerId: string,
+    since: HLCTimestamp,
+    cursor: HLCTimestamp | undefined,
+    requestId: string,
+  ): Promise<SyncResponseMessage> {
+    return new Promise<SyncResponseMessage>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(requestId);
         reject(new Error(`Sync timeout with peer ${peerId}`));
@@ -258,24 +261,49 @@ export class GossipSync {
         resolve(msg);
       });
 
-      this.transport.send(peerId, { ...request, requestId } as SyncMessage);
+      const request: SyncRequestMessage = {
+        type: 'sync-request',
+        since,
+        collections: Object.keys(this.collections),
+        fromNodeId: this.adapter.nodeId,
+        requestId,
+        cursor,
+        pageSize: SYNC_PAGE_SIZE,
+      };
+      this.transport.send(peerId, request);
     });
+  }
 
-    await this._applyRemoteChanges(response.docs);
+  private async _syncWithPeer(peerId: string): Promise<void> {
+    const since = await this._getLastSyncHLC(peerId);
+    const nodeId = this.adapter.nodeId;
+
+    // Phase 1: paginated pull from peer
+    let cursor: HLCTimestamp | undefined;
+    let hasMore = true;
+    while (hasMore) {
+      const response = await this._requestPage(peerId, since, cursor, uuidv4());
+      await this._applyRemoteChanges(response.docs);
+      cursor = response.nextCursor;
+      hasMore = response.hasMore ?? false;
+    }
+
     await this._setLastSyncHLC(peerId, this.adapter.getHLC().now());
 
-    // Send back any changes the peer is missing
+    // Phase 2: paged push — send our changes to the peer in page-sized messages
     const myChanges = await this.adapter.changes(since);
-    if (myChanges.length > 0) {
-      const myDocs = await _fetchDocsForChanges(this.adapter, myChanges);
-      const reply: SyncResponseMessage = {
+    for (let i = 0; i < myChanges.length; i += SYNC_PAGE_SIZE) {
+      const pageChanges = myChanges.slice(i, i + SYNC_PAGE_SIZE);
+      const pageDocs = await _fetchDocsForChanges(this.adapter, pageChanges);
+      const isLast = i + SYNC_PAGE_SIZE >= myChanges.length;
+      await this.transport.sendAsync(peerId, {
         type: 'sync-response',
-        changes: myChanges,
-        docs: myDocs,
+        changes: pageChanges,
+        docs: pageDocs,
         fromNodeId: nodeId,
         requestId: uuidv4(),
-      };
-      this.transport.send(peerId, reply);
+        hasMore: !isLast,
+      });
     }
   }
 
@@ -299,23 +327,38 @@ export class GossipSync {
       await this._handlePeerHello(peerId, msg);
     } else if (msg.type === 'snapshot-request') {
       await sendSnapshotTo(this.transport, this.adapter, peerId, msg.requestId);
+    } else if (msg.type === 'snapshot-stream-start') {
+      await handleSnapshotStreamStart(this.adapter, msg as SnapshotStreamStartMessage);
+    } else if (msg.type === 'snapshot-stream-batch') {
+      await handleSnapshotStreamBatch(this.adapter, msg as SnapshotStreamBatchMessage);
+    } else if (msg.type === 'snapshot-stream-end') {
+      await handleSnapshotStreamEnd(this.adapter, msg as SnapshotStreamEndMessage);
     }
   }
 
   private async _handleSyncRequest(
     peerId: string,
-    msg: SyncRequestMessage & { requestId?: string },
+    msg: SyncRequestMessage,
   ): Promise<void> {
-    const since: HLCTimestamp = msg.since;
-    const changes = await this.adapter.changes(since);
-    const docs = await _fetchDocsForChanges(this.adapter, changes);
+    const since: HLCTimestamp = msg.cursor ?? msg.since;
+    const pageSize = msg.pageSize ?? SYNC_PAGE_SIZE;
+
+    // Fetch one extra to detect whether more pages exist
+    const changes = await this.adapter.changes(since, pageSize + 1);
+    const hasMore = changes.length > pageSize;
+    const page = hasMore ? changes.slice(0, pageSize) : changes;
+    const nextCursor = page.length > 0 ? page[page.length - 1]._updatedAt : since;
+
+    const docs = await _fetchDocsForChanges(this.adapter, page);
 
     const response: SyncResponseMessage = {
       type: 'sync-response',
-      changes,
+      changes: page,
       docs,
       fromNodeId: this.adapter.nodeId,
-      requestId: msg.requestId ?? uuidv4(),
+      requestId: msg.requestId,
+      hasMore,
+      nextCursor,
     };
     this.transport.send(peerId, response);
   }

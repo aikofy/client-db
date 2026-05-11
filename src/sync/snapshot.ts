@@ -2,14 +2,15 @@ import { v4 as uuidv4 } from 'uuid';
 import type {
   IStorageAdapter,
   Snapshot,
-  SnapshotChunkMessage,
   SnapshotRequestMessage,
-  SnapshotResponseMessage,
-  SyncMessage,
+  SnapshotStreamStartMessage,
+  SnapshotStreamBatchMessage,
+  SnapshotStreamEndMessage,
 } from '../core/types.js';
+import type { IndexedDBAdapter } from '../storage/indexeddb.js';
 import type { WebRTCTransport } from './webrtc-transport.js';
 
-const CHUNK_SIZE_BYTES = 256 * 1024; // 256 KB
+const SNAPSHOT_BATCH_SIZE = 500;
 
 export async function exportSnapshot(adapter: IStorageAdapter): Promise<Snapshot> {
   return adapter.export();
@@ -22,18 +23,7 @@ export async function importSnapshot(
   await adapter.import(snapshot);
 }
 
-export function serveSnapshot(
-  transport: WebRTCTransport,
-  adapter: IStorageAdapter,
-): void {
-  const originalOnMessage = transport.onMessage;
-  transport.onMessage = async (peerId, msg) => {
-    if (msg.type === 'snapshot-request') {
-      await sendSnapshotTo(transport, adapter, peerId, msg.requestId);
-    }
-    originalOnMessage(peerId, msg);
-  };
-}
+// ─── Streaming sender ─────────────────────────────────────────────────────────
 
 export async function sendSnapshotTo(
   transport: WebRTCTransport,
@@ -41,87 +31,116 @@ export async function sendSnapshotTo(
   peerId: string,
   requestId: string,
 ): Promise<void> {
-  const snapshot = await adapter.export();
-  const serialized = JSON.stringify(snapshot);
+  const concreteAdapter = adapter as IndexedDBAdapter;
+  const collections = await adapter.collectionNames();
+  const hlc = concreteAdapter.getHLC().now();
 
-  if (serialized.length <= CHUNK_SIZE_BYTES) {
-    const response: SnapshotResponseMessage = {
-      type: 'snapshot-response',
-      requestId,
-      snapshot,
-    };
-    transport.send(peerId, response);
-    return;
+  await transport.sendAsync(peerId, {
+    type: 'snapshot-stream-start',
+    requestId,
+    collections,
+    hlc,
+    version: concreteAdapter.version,
+  } as SnapshotStreamStartMessage);
+
+  for (const name of collections) {
+    let batchIndex = 0;
+    let offset = 0;
+    let done = false;
+
+    while (!done) {
+      const docs = await adapter.query(name, {
+        limit: SNAPSHOT_BATCH_SIZE,
+        offset,
+        includeDeleted: true,
+      });
+      done = docs.length < SNAPSHOT_BATCH_SIZE;
+
+      await transport.sendAsync(peerId, {
+        type: 'snapshot-stream-batch',
+        requestId,
+        collection: name,
+        docs,
+        batchIndex,
+        isLastBatch: done,
+      } as SnapshotStreamBatchMessage);
+
+      offset += docs.length;
+      batchIndex++;
+    }
   }
 
-  // Chunk large snapshots
-  const chunks: string[] = [];
-  for (let i = 0; i < serialized.length; i += CHUNK_SIZE_BYTES) {
-    chunks.push(serialized.slice(i, i + CHUNK_SIZE_BYTES));
-  }
-
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk: SnapshotChunkMessage = {
-      type: 'snapshot-chunk',
-      requestId,
-      chunkIndex: i,
-      totalChunks: chunks.length,
-      data: chunks[i],
-    };
-    transport.send(peerId, chunk);
-  }
+  await transport.sendAsync(peerId, {
+    type: 'snapshot-stream-end',
+    requestId,
+    hlc: concreteAdapter.getHLC().now(),
+  } as SnapshotStreamEndMessage);
 }
+
+// ─── Streaming receiver ───────────────────────────────────────────────────────
+
+interface StreamReceiveState {
+  adapter: IStorageAdapter;
+  resolve: () => void;
+  reject: (e: Error) => void;
+  timeoutId: ReturnType<typeof setTimeout>;
+}
+
+const _activeStreams = new Map<string, StreamReceiveState>();
 
 export function requestSnapshot(
   transport: WebRTCTransport,
   peerId: string,
-): Promise<Snapshot> {
+  adapter: IStorageAdapter,
+): Promise<void> {
   const requestId = uuidv4();
 
-  return new Promise((resolve, reject) => {
-    const chunks = new Map<number, string>();
-    let totalChunks: number | null = null;
-    const timeoutId = setTimeout(() => reject(new Error('Snapshot request timed out')), 60_000);
+  return new Promise<void>((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      _activeStreams.delete(requestId);
+      reject(new Error('Snapshot stream timed out'));
+    }, 120_000);
 
-    const originalOnMessage = transport.onMessage;
-    transport.onMessage = (from, msg: SyncMessage) => {
-      if (from !== peerId) {
-        originalOnMessage(from, msg);
-        return;
-      }
-
-      if (msg.type === 'snapshot-response' && msg.requestId === requestId) {
-        clearTimeout(timeoutId);
-        transport.onMessage = originalOnMessage;
-        resolve(msg.snapshot);
-        return;
-      }
-
-      if (msg.type === 'snapshot-chunk' && msg.requestId === requestId) {
-        chunks.set(msg.chunkIndex, msg.data);
-        totalChunks = msg.totalChunks;
-
-        if (chunks.size === totalChunks) {
-          clearTimeout(timeoutId);
-          transport.onMessage = originalOnMessage;
-          const assembled = Array.from({ length: totalChunks }, (_, i) => chunks.get(i)!).join('');
-          try {
-            resolve(JSON.parse(assembled) as Snapshot);
-          } catch (e) {
-            reject(e);
-          }
-        }
-        return;
-      }
-
-      originalOnMessage(from, msg);
-    };
+    _activeStreams.set(requestId, { adapter, resolve, reject, timeoutId });
 
     const req: SnapshotRequestMessage = {
       type: 'snapshot-request',
-      fromNodeId: transport['config'].nodeId as string,
+      fromNodeId: (transport as unknown as { config: { nodeId: string } }).config.nodeId,
       requestId,
     };
     transport.send(peerId, req);
   });
+}
+
+export async function handleSnapshotStreamStart(
+  _adapter: IStorageAdapter,
+  _msg: SnapshotStreamStartMessage,
+): Promise<void> {
+  // State is tracked in _activeStreams; start message confirms the stream is coming
+}
+
+export async function handleSnapshotStreamBatch(
+  _adapter: IStorageAdapter,
+  msg: SnapshotStreamBatchMessage,
+): Promise<void> {
+  const state = _activeStreams.get(msg.requestId);
+  if (!state) return;
+  await state.adapter.bulkInsert(msg.collection, msg.docs);
+}
+
+export async function handleSnapshotStreamEnd(
+  _adapter: IStorageAdapter,
+  msg: SnapshotStreamEndMessage,
+): Promise<void> {
+  const state = _activeStreams.get(msg.requestId);
+  if (!state) return;
+
+  clearTimeout(state.timeoutId);
+  _activeStreams.delete(msg.requestId);
+
+  const concreteAdapter = state.adapter as IndexedDBAdapter;
+  concreteAdapter.getHLC().update(msg.hlc);
+  await concreteAdapter.persistHLC();
+
+  state.resolve();
 }

@@ -123,8 +123,8 @@ export interface IStorageAdapter {
   /** Insert many records in a single transaction (e.g. snapshot restore). */
   bulkInsert(collection: string, docs: Doc[]): Promise<void>;
 
-  /** Return all change log entries with _updatedAt > since. */
-  changes(since: HLCTimestamp): Promise<ChangeEntry[]>;
+  /** Return all change log entries with _updatedAt > since. Optionally capped to `limit` entries. */
+  changes(since: HLCTimestamp, limit?: number): Promise<ChangeEntry[]>;
 
   /** Full snapshot export as JSON-serialisable object. */
   export(): Promise<Snapshot>;
@@ -146,6 +146,9 @@ export interface SyncRequestMessage {
   since: HLCTimestamp;
   collections: string[];
   fromNodeId: string;
+  requestId: string;
+  cursor?: HLCTimestamp;
+  pageSize?: number;
 }
 
 export interface SyncResponseMessage {
@@ -154,6 +157,8 @@ export interface SyncResponseMessage {
   docs: Doc[];
   fromNodeId: string;
   requestId: string;
+  hasMore?: boolean;
+  nextCursor?: HLCTimestamp;
 }
 
 export interface SnapshotRequestMessage {
@@ -176,6 +181,29 @@ export interface SnapshotResponseMessage {
   snapshot: Snapshot;
 }
 
+export interface SnapshotStreamStartMessage {
+  type: 'snapshot-stream-start';
+  requestId: string;
+  collections: string[];
+  hlc: HLCTimestamp;
+  version: number;
+}
+
+export interface SnapshotStreamBatchMessage {
+  type: 'snapshot-stream-batch';
+  requestId: string;
+  collection: string;
+  docs: Doc[];
+  batchIndex: number;
+  isLastBatch: boolean;
+}
+
+export interface SnapshotStreamEndMessage {
+  type: 'snapshot-stream-end';
+  requestId: string;
+  hlc: HLCTimestamp;
+}
+
 export interface PeerHelloMessage {
   type: 'peer-hello';
   nodeId: string;
@@ -188,4 +216,7 @@ export type SyncMessage =
   | SnapshotRequestMessage
   | SnapshotChunkMessage
   | SnapshotResponseMessage
+  | SnapshotStreamStartMessage
+  | SnapshotStreamBatchMessage
+  | SnapshotStreamEndMessage
   | PeerHelloMessage;
