@@ -102,6 +102,7 @@ export async function createDB<C extends Record<string, CollectionSchema>>(
       transport,
       adapter,
       config.collections as Record<string, CollectionSchema>,
+      config.sync.changeLogTtlDays,
     );
 
     transport.onPeerConnected = () => {

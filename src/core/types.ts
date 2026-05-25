@@ -85,6 +85,10 @@ export interface SyncConfig {
    * Peer connections are delayed until the promise settles.
    */
   initialSnapshot?: Snapshot | Promise<Snapshot | null | undefined>;
+  /** Days to keep change log entries. Older entries are pruned on startup and every 24 h.
+   *  Peers with a watermark older than this TTL receive needsFullSync and re-bootstrap.
+   *  Default: 30. Set to 0 to disable pruning. */
+  changeLogTtlDays?: number;
 }
 
 // ─── DB config ────────────────────────────────────────────────────────────────
@@ -126,6 +130,12 @@ export interface IStorageAdapter {
   /** Return all change log entries with _updatedAt > since. Optionally capped to `limit` entries. */
   changes(since: HLCTimestamp, limit?: number): Promise<ChangeEntry[]>;
 
+  /** Delete change log entries older than `olderThanMs` milliseconds and update the cached oldest-entry watermark. */
+  pruneChanges(olderThanMs: number): Promise<void>;
+
+  /** Return the _updatedAt HLC of the oldest surviving change entry, or null if the log is empty. */
+  getOldestChangesHlc(): Promise<HLCTimestamp | null>;
+
   /** Full snapshot export as JSON-serialisable object. */
   export(): Promise<Snapshot>;
 
@@ -159,6 +169,9 @@ export interface SyncResponseMessage {
   requestId: string;
   hasMore?: boolean;
   nextCursor?: HLCTimestamp;
+  /** True when the requester's `since` watermark predates the oldest surviving change entry.
+   *  The requester must fall back to full snapshot bootstrap. */
+  needsFullSync?: boolean;
 }
 
 export interface SnapshotRequestMessage {

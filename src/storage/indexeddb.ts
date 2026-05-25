@@ -1,6 +1,6 @@
 import { openDB, type IDBPDatabase } from 'idb';
 import { v4 as uuidv4 } from 'uuid';
-import { HLC } from '../core/hlc.js';
+import { HLC, formatHLC } from '../core/hlc.js';
 import { CHANGES_STORE } from '../core/change-log.js';
 import { buildStoreDefinition } from './schema.js';
 import type {
@@ -356,6 +356,38 @@ export class IndexedDBAdapter implements IStorageAdapter {
 
   async close(): Promise<void> {
     this.db.close();
+  }
+
+  async pruneChanges(olderThanMs: number): Promise<void> {
+    const cutoffMs = Date.now() - olderThanMs;
+    const cutoffHlc = formatHLC({ physicalMs: cutoffMs, counter: 0, nodeId: '' });
+
+    const tx = this.db.transaction(CHANGES_STORE, 'readwrite');
+    const index = tx.objectStore(CHANGES_STORE).index('_updatedAt');
+    const range = IDBKeyRange.upperBound(cutoffHlc, false);
+    let cursor = await index.openCursor(range);
+    while (cursor) {
+      await cursor.delete();
+      cursor = await cursor.continue();
+    }
+    await tx.done;
+
+    // Cache the new oldest entry so _handleSyncRequest can check cheaply
+    const tx2 = this.db.transaction(CHANGES_STORE, 'readonly');
+    const first = await tx2.objectStore(CHANGES_STORE).index('_updatedAt').openCursor();
+    await tx2.done;
+    const oldest = first ? (first.value as ChangeEntry)._updatedAt : null;
+    await this.setMetaValue('oldestChangesHlc', oldest);
+  }
+
+  async getOldestChangesHlc(): Promise<HLCTimestamp | null> {
+    const cached = await this.getMetaValue('oldestChangesHlc');
+    if (cached !== undefined && cached !== null) return cached as HLCTimestamp;
+
+    const tx = this.db.transaction(CHANGES_STORE, 'readonly');
+    const cursor = await tx.objectStore(CHANGES_STORE).index('_updatedAt').openCursor();
+    await tx.done;
+    return cursor ? (cursor.value as ChangeEntry)._updatedAt : null;
   }
 
   async getMetaValue(key: string): Promise<unknown> {

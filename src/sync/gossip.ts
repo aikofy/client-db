@@ -36,8 +36,10 @@ export class GossipSync {
   private adapter: IndexedDBAdapter;
   private collections: Record<string, CollectionSchema>;
   private intervalId: ReturnType<typeof setInterval> | null = null;
+  private pruneIntervalId: ReturnType<typeof setInterval> | null = null;
   private pendingRequests = new Map<string, (msg: SyncResponseMessage) => void>();
   private onlineListener: (() => void) | null = null;
+  private readonly ttlMs: number;
 
   // Bootstrap state
   private peerHLCs = new Map<string, HLCTimestamp>();
@@ -51,10 +53,12 @@ export class GossipSync {
     transport: WebRTCTransport,
     adapter: IndexedDBAdapter,
     collections: Record<string, CollectionSchema>,
+    ttlDays = 30,
   ) {
     this.transport = transport;
     this.adapter = adapter;
     this.collections = collections;
+    this.ttlMs = ttlDays > 0 ? ttlDays * 24 * 60 * 60 * 1000 : 0;
   }
 
   start(): void {
@@ -76,10 +80,19 @@ export class GossipSync {
 
     // Initial gossip after connections settle
     setTimeout(() => void this._gossipRound(), 1000);
+
+    if (this.ttlMs > 0) {
+      void this.adapter.pruneChanges(this.ttlMs);
+      this.pruneIntervalId = setInterval(
+        () => void this.adapter.pruneChanges(this.ttlMs),
+        24 * 60 * 60 * 1000,
+      );
+    }
   }
 
   stop(): void {
     if (this.intervalId) clearInterval(this.intervalId);
+    if (this.pruneIntervalId) clearInterval(this.pruneIntervalId);
     if (this.bootstrapTimer) clearTimeout(this.bootstrapTimer);
     if (this.onlineListener && typeof window !== 'undefined') {
       window.removeEventListener('online', this.onlineListener);
@@ -283,6 +296,14 @@ export class GossipSync {
     let hasMore = true;
     while (hasMore) {
       const response = await this._requestPage(peerId, since, cursor, uuidv4());
+
+      if (response.needsFullSync) {
+        // Our watermark predates the peer's oldest change entry — re-bootstrap from snapshot
+        await requestSnapshot(this.transport, peerId, this.adapter).catch(() => undefined);
+        await this._setLastSyncHLC(peerId, this.adapter.getHLC().now());
+        return;
+      }
+
       await this._applyRemoteChanges(response.docs);
       cursor = response.nextCursor;
       hasMore = response.hasMore ?? false;
@@ -341,6 +362,22 @@ export class GossipSync {
     msg: SyncRequestMessage,
   ): Promise<void> {
     const since: HLCTimestamp = msg.cursor ?? msg.since;
+
+    if (this.ttlMs > 0) {
+      const oldest = await this.adapter.getOldestChangesHlc();
+      if (oldest !== null && since < oldest) {
+        this.transport.send(peerId, {
+          type: 'sync-response',
+          changes: [],
+          docs: [],
+          fromNodeId: this.adapter.nodeId,
+          requestId: msg.requestId,
+          needsFullSync: true,
+        });
+        return;
+      }
+    }
+
     const pageSize = msg.pageSize ?? SYNC_PAGE_SIZE;
 
     // Fetch one extra to detect whether more pages exist

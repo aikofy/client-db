@@ -1,7 +1,7 @@
 export { createDB } from './db.js';
 export type { TypedDB, DBBase, CollectionProxy, SyncStatus } from './db.js';
 
-export { HLC, parseHLC } from './core/hlc.js';
+export { HLC, parseHLC, formatHLC } from './core/hlc.js';
 export type { HLCState } from './core/hlc.js';
 
 export type {

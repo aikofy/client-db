@@ -27,7 +27,7 @@ export function parseHLC(ts: HLCTimestamp): HLCState {
   };
 }
 
-function formatHLC(state: HLCState): HLCTimestamp {
+export function formatHLC(state: HLCState): HLCTimestamp {
   return `${padMs(state.physicalMs)}-${padCounter(state.counter)}-${state.nodeId}` as HLCTimestamp;
 }
 
