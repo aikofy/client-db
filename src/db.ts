@@ -6,7 +6,9 @@ import type {
   Doc,
   HLCTimestamp,
   QueryOptions,
+  ScanOptions,
   Snapshot,
+  SnapshotChunk,
   ChangeEntry,
   CollectionSchema,
 } from './core/types.js';
@@ -19,6 +21,12 @@ export interface CollectionProxy<T extends Record<string, unknown> = Record<stri
   put(doc: T & { _id?: string }): Promise<Doc<T>>;
   get(id: string): Promise<Doc<T> | null>;
   query(options?: QueryOptions<T>): Promise<Doc<T>[]>;
+  /**
+   * Streaming, bounded-memory iteration in `_id` order. Use for large scans
+   * where `query()` would materialize the whole collection.
+   * `for await (const doc of db.todos.scan({ where: { status: 'open' } })) { … }`
+   */
+  scan(options?: ScanOptions<T>): AsyncGenerator<Doc<T>>;
   delete(id: string): Promise<void>;
   onChange(cb: ChangeCallback): () => void;
 }
@@ -27,6 +35,14 @@ export interface CollectionProxy<T extends Record<string, unknown> = Record<stri
 export interface DBBase {
   export(): Promise<Snapshot>;
   import(snapshot: Snapshot): Promise<void>;
+  /**
+   * Streaming export — yields a header then bounded doc batches. Peak memory is
+   * one batch, so it scales to multi-GB stores where `export()` would OOM.
+   * Pair with `snapshotChunksToNdjsonStream` to back up to a file/Drive.
+   */
+  exportStream(batchSize?: number): AsyncGenerator<SnapshotChunk>;
+  /** Streaming restore — consumes chunks from `exportStream` (or NDJSON). */
+  importStream(chunks: AsyncIterable<SnapshotChunk>): Promise<void>;
   readonly syncStatus: SyncStatus;
   close(): Promise<void>;
 }
@@ -54,6 +70,9 @@ function makeCollectionProxy<T extends Record<string, unknown>>(
     async query(options) {
       return adapter.query(name, options as QueryOptions) as Promise<Doc<T>[]>;
     },
+    scan(options) {
+      return adapter.scan(name, options as ScanOptions) as AsyncGenerator<Doc<T>>;
+    },
     async delete(id) {
       return adapter.delete(name, id);
     },
@@ -65,7 +84,27 @@ function makeCollectionProxy<T extends Record<string, unknown>>(
   };
 }
 
-export async function createDB<C extends Record<string, CollectionSchema>>(
+/**
+ * Open DBs are deduped by `name`. Concurrent or repeated calls to `createDB`
+ * with the same name return the same in-flight promise — preventing the
+ * "two transports, same nodeId" reconnect loop under React StrictMode and
+ * other double-invocation patterns. The registry entry is cleared when the
+ * DB is closed or when initial open rejects, so close-then-reopen works.
+ */
+const _openDbs = new Map<string, Promise<unknown>>();
+
+export function createDB<C extends Record<string, CollectionSchema>>(
+  config: DBConfig & { collections: C },
+): Promise<TypedDB<C>> {
+  const existing = _openDbs.get(config.name);
+  if (existing) return existing as Promise<TypedDB<C>>;
+  const promise = _createDB(config);
+  _openDbs.set(config.name, promise);
+  promise.catch(() => { _openDbs.delete(config.name); });
+  return promise;
+}
+
+async function _createDB<C extends Record<string, CollectionSchema>>(
   config: DBConfig & { collections: C },
 ): Promise<TypedDB<C>> {
   const adapter = new IndexedDBAdapter(config.name, config.version, config.collections);
@@ -73,21 +112,22 @@ export async function createDB<C extends Record<string, CollectionSchema>>(
 
   const changeListeners = new Map<string, Set<ChangeCallback>>();
 
-  adapter.onChangeEntry((entry) => {
+  adapter.onChangeEntry((entry, doc) => {
     const cbs = changeListeners.get(entry.collection);
     if (cbs && cbs.size > 0) {
       for (const cb of cbs) cb([entry]);
     }
-    if (gossip) {
-      void adapter.get(entry.collection, entry.id).then((doc) => {
-        if (doc) gossip!.broadcastDoc(entry.collection, doc);
-      });
-    }
+    // The doc is already in hand from the write — broadcast it directly instead
+    // of re-reading it from IndexedDB.
+    if (gossip) gossip.broadcastDoc(entry.collection, doc);
   });
 
   let transport: WebRTCTransport | null = null;
   let gossip: GossipSync | null = null;
   let syncStatus: SyncStatus = 'offline';
+  let syncSettleTimer: ReturnType<typeof setTimeout> | null = null;
+  let onWindowOnline: (() => void) | null = null;
+  let onWindowOffline: (() => void) | null = null;
 
   if (config.sync) {
     const nodeId = adapter.nodeId;
@@ -105,8 +145,18 @@ export async function createDB<C extends Record<string, CollectionSchema>>(
       config.sync.changeLogTtlDays,
     );
 
+    const SYNC_SETTLE_MS = 1500;
+
     transport.onPeerConnected = () => {
       syncStatus = 'syncing';
+      if (syncSettleTimer) clearTimeout(syncSettleTimer);
+      syncSettleTimer = setTimeout(() => { syncStatus = 'online'; }, SYNC_SETTLE_MS);
+    };
+
+    transport.onPeerDisconnected = () => {
+      if (transport!.peers().length === 0) {
+        syncStatus = typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'online';
+      }
     };
 
     if (config.sync.initialSnapshot !== undefined) {
@@ -126,8 +176,10 @@ export async function createDB<C extends Record<string, CollectionSchema>>(
 
     if (typeof window !== 'undefined') {
       syncStatus = navigator.onLine ? 'online' : 'offline';
-      window.addEventListener('online', () => { syncStatus = 'online'; });
-      window.addEventListener('offline', () => { syncStatus = 'offline'; });
+      onWindowOnline = () => { syncStatus = 'online'; };
+      onWindowOffline = () => { syncStatus = 'offline'; };
+      window.addEventListener('online', onWindowOnline);
+      window.addEventListener('offline', onWindowOffline);
     }
   }
 
@@ -147,11 +199,25 @@ export async function createDB<C extends Record<string, CollectionSchema>>(
       await adapter.import(snapshot);
     },
 
+    exportStream(batchSize?: number): AsyncGenerator<SnapshotChunk> {
+      return adapter.exportStream(batchSize);
+    },
+
+    async importStream(chunks: AsyncIterable<SnapshotChunk>): Promise<void> {
+      await adapter.importStream(chunks);
+    },
+
     get syncStatus(): SyncStatus {
       return syncStatus;
     },
 
     async close(): Promise<void> {
+      _openDbs.delete(config.name);
+      if (syncSettleTimer) clearTimeout(syncSettleTimer);
+      if (typeof window !== 'undefined') {
+        if (onWindowOnline) window.removeEventListener('online', onWindowOnline);
+        if (onWindowOffline) window.removeEventListener('offline', onWindowOffline);
+      }
       gossip?.stop();
       transport?.disconnect();
       await adapter.close();

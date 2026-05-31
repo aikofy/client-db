@@ -399,6 +399,43 @@ await db.import(snapshot);
 
 Large snapshots (>256 KB) are automatically chunked over the WebRTC data channel.
 
+> **Heads-up:** `db.export()` / `db.import()` materialise the **whole** dataset in memory. For databases beyond a few hundred MB, use the streaming API below — it never holds more than one batch in memory.
+
+---
+
+### Streaming API (large databases)
+
+`export()`, `import()`, and an unbounded `query()` all load their full result set into the JS heap, which will exhaust memory on multi-GB stores. The streaming variants page the data and keep peak memory bounded to a single batch, so they scale to multi-GB databases.
+
+```typescript
+// Bounded-memory backup → NDJSON byte stream → upload (no full copy in RAM)
+import { snapshotChunksToNdjsonStream, ndjsonStreamToSnapshotChunks } from '@aikofy/client-db';
+
+const body = snapshotChunksToNdjsonStream(db.exportStream(/* batchSize = 1000 */));
+await fetch(uploadUrl, { method: 'POST', body, duplex: 'half' });
+
+// Bounded-memory restore from a download stream
+const res = await fetch(downloadUrl);
+await db.importStream(ndjsonStreamToSnapshotChunks(res.body!));
+```
+
+```typescript
+// Iterate a large collection without materialising it (one page at a time)
+for await (const todo of db.todos.scan({ where: { status: 'open' }, batchSize: 1000 })) {
+  process(todo); // pages by _id, yields in _id order
+}
+```
+
+| Method | Returns | Notes |
+|--------|---------|-------|
+| `db.exportStream(batchSize?)` | `AsyncGenerator<SnapshotChunk>` | header + keyset-paged batches; tombstones included |
+| `db.importStream(chunks)` | `Promise<void>` | consumes chunks; HLC watermark applied **after** all data lands |
+| `db.<collection>.scan(opts?)` | `AsyncGenerator<Doc>` | `where` + `includeDeleted`; `_id` order; no `orderBy` (use `query()` for sorted) |
+| `snapshotChunksToNdjsonStream(chunks)` | `ReadableStream<Uint8Array>` | encode chunks as NDJSON, backpressure-aware |
+| `ndjsonStreamToSnapshotChunks(stream)` | `AsyncGenerator<SnapshotChunk>` | decode NDJSON bytes back to chunks |
+
+Each stage holds only one batch (`batchSize` docs) at a time, so memory stays flat regardless of database size.
+
 ---
 
 ### Advanced: Direct HLC Access
@@ -436,6 +473,61 @@ class MySQLiteAdapter implements IStorageAdapter {
 ```
 
 All sync, HLC, and conflict resolution logic is adapter-agnostic and reusable as-is.
+
+---
+
+## Caveats & Patterns
+
+### `createDB` is idempotent per `name`
+
+Concurrent or repeated `createDB` calls with the same `name` return the **same** in-flight promise. You can safely call it from a React `useEffect` (including under StrictMode, which double-fires effects in dev) without producing two transports.
+
+The registry is cleared on `db.close()`, so close-then-reopen produces a fresh instance.
+
+> **Why this matters:** Without dedup, two `createDB` calls would each spin up a `WebRTCTransport` sharing the same persisted nodeId. The signaling server's "one connection per nodeId per room" rule then alternately kicks each socket with close code `1000 'replaced by new connection'` → reconnect → kick → loop.
+
+### Running multiple tabs of the same browser
+
+The HLC `nodeId` (used for causal ordering) is persisted in IndexedDB and shared across same-origin tabs. The **signaling** `nodeId` should be unique per tab — otherwise the signaling server kicks the older tab when the newer one connects (same room, same nodeId).
+
+The recommended pattern is to override `sync.nodeId` with a per-tab UUID stored in `sessionStorage`:
+
+```typescript
+function getSignalNodeId(): string {
+  const KEY = 'myapp-signal-node-id';
+  let id = sessionStorage.getItem(KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    sessionStorage.setItem(KEY, id);
+  }
+  return id;
+}
+
+const db = await createDB({
+  name: currentUser.id,
+  version: 1,
+  collections,
+  sync: {
+    signalingServer: `wss://signal.example.com/signal?token=${token}`,
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    nodeId: getSignalNodeId(),   // per-tab — distinct from the IDB-persisted HLC nodeId
+  },
+});
+```
+
+`sessionStorage` is per-tab (unlike `localStorage`), so each tab gets a unique UUID. The HLC nodeId stays in IndexedDB unchanged — only signaling identity is per-tab.
+
+### Peer changes and derived caches
+
+If your app caches values derived from synced collections (e.g. account balances aggregated from transactions), **invalidate those caches inside your `onChange` peer handler** — local-write code paths typically invalidate caches inline, but peer writes land via gossip and bypass that code.
+
+```typescript
+db.transactions.onChange((changes) => {
+  if (!changes.some(c => c.origin === 'peer')) return;
+  balanceCache.invalidateAll();   // peer txns shifted balances
+  refetchAccounts();              // now returns fresh computedBalance
+});
+```
 
 ---
 

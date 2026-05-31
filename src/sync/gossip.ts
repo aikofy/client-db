@@ -6,9 +6,9 @@ import {
   handleSnapshotStreamStart,
   handleSnapshotStreamBatch,
   handleSnapshotStreamEnd,
+  cancelActiveStreams,
 } from './snapshot.js';
 import type {
-  IStorageAdapter,
   HLCTimestamp,
   Doc,
   SyncRequestMessage,
@@ -40,6 +40,9 @@ export class GossipSync {
   private pendingRequests = new Map<string, (msg: SyncResponseMessage) => void>();
   private onlineListener: (() => void) | null = null;
   private readonly ttlMs: number;
+  private stopped = false;
+  /** peers with an in-flight _syncWithPeer, to avoid overlapping duplicate syncs. */
+  private readonly _syncing = new Set<string>();
 
   // Bootstrap state
   private peerHLCs = new Map<string, HLCTimestamp>();
@@ -71,6 +74,14 @@ export class GossipSync {
       this._onPeerConnected(peerId);
     };
 
+    // Forget a peer's advertised HLC when it disconnects so the map doesn't grow
+    // across a churny session and stale entries can't influence best-peer choice.
+    const upstreamDisconnected = this.transport.onPeerDisconnected;
+    this.transport.onPeerDisconnected = (peerId) => {
+      upstreamDisconnected(peerId);
+      this.peerHLCs.delete(peerId);
+    };
+
     this.intervalId = setInterval(() => void this._gossipRound(), GOSSIP_INTERVAL_MS);
 
     if (typeof window !== 'undefined') {
@@ -91,12 +102,17 @@ export class GossipSync {
   }
 
   stop(): void {
+    this.stopped = true;
     if (this.intervalId) clearInterval(this.intervalId);
     if (this.pruneIntervalId) clearInterval(this.pruneIntervalId);
     if (this.bootstrapTimer) clearTimeout(this.bootstrapTimer);
     if (this.onlineListener && typeof window !== 'undefined') {
       window.removeEventListener('online', this.onlineListener);
     }
+    // Reject any in-flight snapshot receives for this adapter so a teardown can't
+    // leave a 120s timer running or a hanging requestSnapshot promise.
+    cancelActiveStreams(this.adapter);
+    this.peerHLCs.clear();
     this.pendingBroadcasts = [];
   }
 
@@ -151,7 +167,7 @@ export class GossipSync {
 
     // Fix B: debounce — collect peer-hellos for BOOTSTRAP_DELAY_MS before picking the best peer
     if (this.bootstrapTimer) clearTimeout(this.bootstrapTimer);
-    this.bootstrapTimer = setTimeout(() => void this._maybeBootstrap(), BOOTSTRAP_DELAY_MS);
+    this.bootstrapTimer = setTimeout(() => void this._maybeBootstrap().catch(() => undefined), BOOTSTRAP_DELAY_MS);
   }
 
   /**
@@ -167,7 +183,7 @@ export class GossipSync {
    *    reconnects are handled by _onOnline().
    */
   private async _maybeBootstrap(): Promise<void> {
-    if (this.bootstrapped || this.bootstrapping) return;
+    if (this.bootstrapped || this.bootstrapping || this.stopped) return;
     this.bootstrapping = true;
 
     try {
@@ -177,7 +193,7 @@ export class GossipSync {
         const bestPeer = this._findBestPeer();
         if (!bestPeer) {
           // No peers with known HLC yet — re-arm the timer so we retry when more arrive
-          this.bootstrapTimer = setTimeout(() => void this._maybeBootstrap(), BOOTSTRAP_DELAY_MS);
+          this.bootstrapTimer = setTimeout(() => void this._maybeBootstrap().catch(() => undefined), BOOTSTRAP_DELAY_MS);
           return;
         }
 
@@ -224,11 +240,9 @@ export class GossipSync {
   }
 
   private async _isDBEmpty(): Promise<boolean> {
-    for (const collection of Object.keys(this.collections)) {
-      const docs = await this.adapter.query(collection, { limit: 1, includeDeleted: true });
-      if (docs.length > 0) return false;
-    }
-    return true;
+    // One readonly transaction with count() (no doc deserialization), vs one
+    // transaction + one cursor materialization per collection.
+    return this.adapter.areStoresEmpty(Object.keys(this.collections));
   }
 
   // ─── Reconnect ────────────────────────────────────────────────────────────────
@@ -288,72 +302,105 @@ export class GossipSync {
   }
 
   private async _syncWithPeer(peerId: string): Promise<void> {
-    const since = await this._getLastSyncHLC(peerId);
-    const nodeId = this.adapter.nodeId;
+    // Skip if a sync with this peer is already in flight — overlapping gossip
+    // rounds, the initial round, _onOnline and post-bootstrap hellos can all
+    // target the same peer and would otherwise duplicate the whole phase-2 push.
+    if (this._syncing.has(peerId)) return;
+    this._syncing.add(peerId);
+    try {
+      const since = await this._getLastSyncHLC(peerId);
+      const nodeId = this.adapter.nodeId;
 
-    // Phase 1: paginated pull from peer
-    let cursor: HLCTimestamp | undefined;
-    let hasMore = true;
-    while (hasMore) {
-      const response = await this._requestPage(peerId, since, cursor, uuidv4());
+      // Phase 1: paginated pull from peer
+      let cursor: HLCTimestamp | undefined;
+      let hasMore = true;
+      while (hasMore && !this.stopped) {
+        const response = await this._requestPage(peerId, since, cursor, uuidv4());
 
-      if (response.needsFullSync) {
-        // Our watermark predates the peer's oldest change entry — re-bootstrap from snapshot
-        await requestSnapshot(this.transport, peerId, this.adapter).catch(() => undefined);
-        await this._setLastSyncHLC(peerId, this.adapter.getHLC().now());
-        return;
+        if (response.needsFullSync) {
+          // Our watermark predates the peer's oldest change entry — re-bootstrap
+          // from a snapshot. Only advance the watermark if the snapshot actually
+          // succeeds; otherwise the un-streamed changes would be skipped forever.
+          try {
+            await requestSnapshot(this.transport, peerId, this.adapter);
+            await this._setLastSyncHLC(peerId, this.adapter.getHLC().now());
+          } catch {
+            // leave watermark; next round re-detects needsFullSync and retries
+          }
+          return;
+        }
+
+        await this._applyRemoteChanges(response.docs);
+        cursor = response.nextCursor;
+        hasMore = response.hasMore ?? false;
       }
+      if (this.stopped) return;
 
-      await this._applyRemoteChanges(response.docs);
-      cursor = response.nextCursor;
-      hasMore = response.hasMore ?? false;
-    }
+      await this._setLastSyncHLC(peerId, this.adapter.getHLC().now());
 
-    await this._setLastSyncHLC(peerId, this.adapter.getHLC().now());
-
-    // Phase 2: paged push — send our changes to the peer in page-sized messages
-    const myChanges = await this.adapter.changes(since);
-    for (let i = 0; i < myChanges.length; i += SYNC_PAGE_SIZE) {
-      const pageChanges = myChanges.slice(i, i + SYNC_PAGE_SIZE);
-      const pageDocs = await _fetchDocsForChanges(this.adapter, pageChanges);
-      const isLast = i + SYNC_PAGE_SIZE >= myChanges.length;
-      await this.transport.sendAsync(peerId, {
-        type: 'sync-response',
-        changes: pageChanges,
-        docs: pageDocs,
-        fromNodeId: nodeId,
-        requestId: uuidv4(),
-        hasMore: !isLast,
-      });
+      // Phase 2: paged push — page the change log by keyset (each page is one
+      // bounded read) instead of materializing the entire change set at once.
+      let pushCursor: HLCTimestamp = since;
+      for (;;) {
+        if (this.stopped) return;
+        const fetched = await this.adapter.changes(pushCursor, SYNC_PAGE_SIZE + 1);
+        if (fetched.length === 0) break;
+        const isLast = fetched.length <= SYNC_PAGE_SIZE;
+        const pageChanges = isLast ? fetched : fetched.slice(0, SYNC_PAGE_SIZE);
+        const pageDocs = await _fetchDocsForChanges(this.adapter, pageChanges);
+        await this.transport.sendAsync(peerId, {
+          type: 'sync-response',
+          changes: pageChanges,
+          docs: pageDocs,
+          fromNodeId: nodeId,
+          requestId: uuidv4(),
+          hasMore: !isLast,
+        });
+        pushCursor = pageChanges[pageChanges.length - 1]._updatedAt;
+        if (isLast) break;
+      }
+    } finally {
+      this._syncing.delete(peerId);
     }
   }
 
   private async _handleMessage(peerId: string, msg: SyncMessage): Promise<void> {
-    if (msg.type === 'sync-request') {
-      await this._handleSyncRequest(peerId, msg);
-    } else if (msg.type === 'sync-response') {
-      const handler = this.pendingRequests.get(msg.requestId);
-      if (handler) {
-        this.pendingRequests.delete(msg.requestId);
-        handler(msg);
-      } else {
-        // Fix A: unsolicited broadcast — buffer during bootstrap to avoid snapshot overwrite race
-        if (this.bootstrapping) {
-          this.pendingBroadcasts.push(msg.docs);
+    if (this.stopped) return;
+    // This runs fire-and-forget from the transport. Catch here so a failed apply
+    // (quota, tx abort, closed DB) can't surface as an unhandled rejection or
+    // silently drop the rest of the dispatch. A dropped message is re-pulled next
+    // gossip round (lastSync only advances on success), so no writes are lost.
+    try {
+      if (msg.type === 'sync-request') {
+        await this._handleSyncRequest(peerId, msg);
+      } else if (msg.type === 'sync-response') {
+        const handler = this.pendingRequests.get(msg.requestId);
+        if (handler) {
+          this.pendingRequests.delete(msg.requestId);
+          handler(msg);
         } else {
-          await this._applyRemoteChanges(msg.docs);
+          // Fix A: unsolicited broadcast — buffer during bootstrap to avoid snapshot overwrite race
+          if (this.bootstrapping) {
+            this.pendingBroadcasts.push(msg.docs);
+          } else {
+            await this._applyRemoteChanges(msg.docs);
+          }
         }
+      } else if (msg.type === 'peer-hello') {
+        await this._handlePeerHello(peerId, msg);
+      } else if (msg.type === 'snapshot-request') {
+        await sendSnapshotTo(this.transport, this.adapter, peerId, msg.requestId);
+      } else if (msg.type === 'snapshot-stream-start') {
+        await handleSnapshotStreamStart(this.adapter, msg as SnapshotStreamStartMessage);
+      } else if (msg.type === 'snapshot-stream-batch') {
+        await handleSnapshotStreamBatch(this.adapter, msg as SnapshotStreamBatchMessage);
+      } else if (msg.type === 'snapshot-stream-end') {
+        await handleSnapshotStreamEnd(this.adapter, msg as SnapshotStreamEndMessage);
       }
-    } else if (msg.type === 'peer-hello') {
-      await this._handlePeerHello(peerId, msg);
-    } else if (msg.type === 'snapshot-request') {
-      await sendSnapshotTo(this.transport, this.adapter, peerId, msg.requestId);
-    } else if (msg.type === 'snapshot-stream-start') {
-      await handleSnapshotStreamStart(this.adapter, msg as SnapshotStreamStartMessage);
-    } else if (msg.type === 'snapshot-stream-batch') {
-      await handleSnapshotStreamBatch(this.adapter, msg as SnapshotStreamBatchMessage);
-    } else if (msg.type === 'snapshot-stream-end') {
-      await handleSnapshotStreamEnd(this.adapter, msg as SnapshotStreamEndMessage);
+    } catch (err) {
+      queueMicrotask(() => {
+        throw err;
+      });
     }
   }
 
@@ -402,31 +449,70 @@ export class GossipSync {
 
   private async _applyRemoteChanges(docs: Doc[]): Promise<void> {
     const hlc = this.adapter.getHLC();
+    const before = hlc.now();
 
+    // Advance the HLC for every remote doc (in order) and group docs by
+    // collection. Behaviour matches the previous per-doc loop: HLC is advanced
+    // for every remote (including skipped ones), unknown collections are ignored.
+    const byCollection = new Map<string, Doc[]>();
     for (const remote of docs) {
       hlc.update(remote._updatedAt);
       const collection = remote['_collection'] as string | undefined;
       if (!collection || !this.collections[collection]) continue;
+      let arr = byCollection.get(collection);
+      if (!arr) byCollection.set(collection, (arr = []));
+      arr.push(remote);
+    }
 
-      const local = await this.adapter.get(collection, remote._id);
-      let resolved: Doc;
+    for (const [collection, remotes] of byCollection) {
+      // Dedupe by _id keeping the last occurrence. Within a single batch the
+      // duplicates carry the same current doc, so this matches the old
+      // "apply once, later identical entries are no-ops" behaviour while
+      // emitting exactly one change/broadcast per id.
+      const lastById = new Map<string, Doc>();
+      for (const r of remotes) lastById.set(r._id, r);
+      const unique = Array.from(lastById.values());
 
-      if (!local) {
-        resolved = remote;
-      } else if (local._rev === remote._rev) {
-        continue;
-      } else {
-        const strategy = this.collections[collection]?.conflictStrategy ?? 'lww';
-        resolved = resolveConflict(local, remote, strategy);
+      // Prefetch all local docs for this collection in ONE readonly transaction,
+      // then resolve in memory and write the survivors in ONE bulkInsert — instead
+      // of a get + single-doc bulkInsert (two transactions) per remote doc.
+      const locals = await this.adapter.getMany(collection, unique.map((r) => r._id));
+      const strategy = this.collections[collection]?.conflictStrategy ?? 'lww';
+      const toWrite: Doc[] = [];
+
+      for (let i = 0; i < unique.length; i++) {
+        const remote = unique[i];
+        const local = locals[i];
+        let resolved: Doc;
+
+        if (!local) {
+          resolved = remote;
+        } else if (local._rev === remote._rev) {
+          continue;
+        } else {
+          resolved = resolveConflict(local, remote, strategy);
+          if (resolved !== local) {
+            await logConflict(this.adapter, collection, local, remote, resolved);
+          }
+        }
+
         if (resolved !== local) {
-          await logConflict(this.adapter, collection, local, remote, resolved);
+          // Strip the transport-only `_collection` routing tag so it is never
+          // persisted into the user's object store (it isn't part of SystemFields).
+          const { _collection, ...clean } = resolved as Doc & { _collection?: string };
+          void _collection;
+          toWrite.push(clean as Doc);
         }
       }
 
-      if (resolved !== local) {
-        await this.adapter.bulkInsert(collection, [resolved]);
-      }
+      if (toWrite.length > 0) await this.adapter.bulkInsert(collection, toWrite);
     }
+
+    // Persist the HLC watermark if a remote advanced it. put()/delete() persist on
+    // local writes, but bulkInsert does not — without this, a reload before the
+    // next local write would restore a stale watermark and a later local edit could
+    // mint a _rev ≤ an already-stored remote rev and silently lose under LWW.
+    if (hlc.now() !== before) await this.adapter.persistHLC();
   }
 
   private async _getLastSyncHLC(peerId: string): Promise<HLCTimestamp> {
@@ -449,15 +535,9 @@ function _pickRandom<T>(arr: T[], k: number): T[] {
 }
 
 async function _fetchDocsForChanges(
-  adapter: IStorageAdapter,
+  adapter: IndexedDBAdapter,
   changes: Array<{ id: string; collection: string }>,
 ): Promise<Doc[]> {
-  const docs: Doc[] = [];
-  for (const entry of changes) {
-    const doc = await adapter.get(entry.collection, entry.id);
-    if (doc) {
-      docs.push({ ...doc, _collection: entry.collection } as Doc & { _collection: string });
-    }
-  }
-  return docs;
+  // One readonly transaction for the whole page instead of N sequential gets.
+  return adapter.getManyForChanges(changes);
 }

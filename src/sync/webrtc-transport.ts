@@ -14,18 +14,23 @@ interface PeerState {
   conn: RTCPeerConnection;
   channel: RTCDataChannel | null;
   channelOpen: boolean;
+  /** ICE candidates received before setRemoteDescription; applied on drain. */
+  pendingCandidates: RTCIceCandidateInit[];
 }
 
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
 const BACKPRESSURE_HIGH_WATER = 16 * 1024 * 1024; // 16 MB
 const BACKPRESSURE_LOW_WATER = 1 * 1024 * 1024;   //  1 MB
+const BACKPRESSURE_TIMEOUT_MS = 30000;            // backstop so a stalled channel can't hang a send forever
+const SIGNALING_TYPES = ['peer-list', 'offer', 'answer', 'ice-candidate'];
 
 export class WebRTCTransport {
   private config: WebRTCTransportConfig;
   private ws: WebSocket | null = null;
   private peerStates = new Map<string, PeerState>();
   private reconnectAttempt = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
   private pendingMessages = new Map<string, SyncMessage[]>();
 
@@ -46,7 +51,10 @@ export class WebRTCTransport {
     if (this.stopped) return;
 
     try {
-      const url = _appendRoomParam(this.config.signalingServerUrl, this.config.room);
+      const url = _appendParams(this.config.signalingServerUrl, {
+        room: this.config.room,
+        nodeId: this.config.nodeId,
+      });
       this.ws = new WebSocket(url);
     } catch {
       this._scheduleReconnect();
@@ -54,7 +62,9 @@ export class WebRTCTransport {
     }
 
     this.ws.onopen = () => {
-      this.reconnectAttempt = 0;
+      // Do NOT reset the backoff here — a server that accepts then immediately
+      // closes would loop at the base delay forever. Reset only once we receive
+      // a real signaling message (proof the server is actually healthy).
       this.ws!.send(JSON.stringify({ type: 'register', nodeId: this.config.nodeId }));
     };
 
@@ -85,10 +95,16 @@ export class WebRTCTransport {
       RECONNECT_MAX_MS,
     );
     this.reconnectAttempt += 1;
-    setTimeout(() => this._openWS(), delay);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this._openWS();
+    }, delay);
   }
 
   private _handleSignalingMessage(msg: Record<string, unknown>): void {
+    // A recognized signaling message proves the server is healthy → reset backoff.
+    if (SIGNALING_TYPES.includes(msg['type'] as string)) this.reconnectAttempt = 0;
+
     switch (msg['type']) {
       case 'peer-list': {
         const peers = msg['peers'] as string[];
@@ -102,21 +118,26 @@ export class WebRTCTransport {
       case 'offer': {
         const from = msg['from'] as string;
         const offer = msg['sdp'] as RTCSessionDescriptionInit;
-        void this._handleOffer(from, offer);
+        void this._handleOffer(from, offer).catch(() => this._removePeer(from));
         break;
       }
       case 'answer': {
         const from = msg['from'] as string;
         const answer = msg['sdp'] as RTCSessionDescriptionInit;
         const state = this.peerStates.get(from);
-        if (state) void state.conn.setRemoteDescription(answer);
+        if (state) {
+          void state.conn
+            .setRemoteDescription(answer)
+            .then(() => this._drainCandidates(state))
+            .catch(() => this._removePeer(from));
+        }
         break;
       }
       case 'ice-candidate': {
         const from = msg['from'] as string;
         const candidate = msg['candidate'] as RTCIceCandidateInit;
         const state = this.peerStates.get(from);
-        if (state) void state.conn.addIceCandidate(candidate);
+        if (state) this._addIceCandidate(state, candidate);
         break;
       }
     }
@@ -125,7 +146,7 @@ export class WebRTCTransport {
   private _initiateConnection(peerId: string): void {
     const conn = new RTCPeerConnection({ iceServers: this.config.iceServers });
     const channel = conn.createDataChannel('sync', { ordered: true });
-    const state: PeerState = { conn, channel, channelOpen: false };
+    const state: PeerState = { conn, channel, channelOpen: false, pendingCandidates: [] };
     this.peerStates.set(peerId, state);
 
     this._wireChannel(peerId, channel, state);
@@ -141,15 +162,30 @@ export class WebRTCTransport {
           from: this.config.nodeId,
           sdp: conn.localDescription!,
         });
-      });
+      })
+      .catch(() => this._removePeer(peerId));
   }
 
   private async _handleOffer(
     peerId: string,
     offer: RTCSessionDescriptionInit,
   ): Promise<void> {
+    // Glare: both peers offered simultaneously. Break the tie deterministically
+    // so exactly one side proceeds — the "impolite" peer keeps its own offer and
+    // ignores this one; the "polite" peer drops its in-flight conn and answers.
+    const existing = this.peerStates.get(peerId);
+    if (existing) {
+      const impolite = this.config.nodeId < peerId;
+      if (impolite) return;
+      existing.conn.onconnectionstatechange = null;
+      existing.conn.onicecandidate = null;
+      if (existing.channel) existing.channel.onclose = null;
+      existing.conn.close();
+      this.peerStates.delete(peerId);
+    }
+
     const conn = new RTCPeerConnection({ iceServers: this.config.iceServers });
-    const state: PeerState = { conn, channel: null, channelOpen: false };
+    const state: PeerState = { conn, channel: null, channelOpen: false, pendingCandidates: [] };
     this.peerStates.set(peerId, state);
 
     conn.ondatachannel = (evt) => {
@@ -160,6 +196,7 @@ export class WebRTCTransport {
     this._wireICE(peerId, conn);
 
     await conn.setRemoteDescription(offer);
+    this._drainCandidates(state);
     const answer = await conn.createAnswer();
     await conn.setLocalDescription(answer);
     this._sendSignal({
@@ -168,6 +205,21 @@ export class WebRTCTransport {
       from: this.config.nodeId,
       sdp: conn.localDescription!,
     });
+  }
+
+  /** Apply an ICE candidate, or buffer it until the remote description is set. */
+  private _addIceCandidate(state: PeerState, candidate: RTCIceCandidateInit): void {
+    if (state.conn.remoteDescription === null) {
+      state.pendingCandidates.push(candidate);
+    } else {
+      void state.conn.addIceCandidate(candidate).catch(() => undefined);
+    }
+  }
+
+  private _drainCandidates(state: PeerState): void {
+    const pending = state.pendingCandidates;
+    state.pendingCandidates = [];
+    for (const c of pending) void state.conn.addIceCandidate(c).catch(() => undefined);
   }
 
   private _wireICE(peerId: string, conn: RTCPeerConnection): void {
@@ -228,6 +280,8 @@ export class WebRTCTransport {
     if (!state) return;
     state.conn.close();
     this.peerStates.delete(peerId);
+    // Drop any messages queued for a peer that will never open its channel.
+    this.pendingMessages.delete(peerId);
     this.onPeerDisconnected(peerId);
   }
 
@@ -243,22 +297,42 @@ export class WebRTCTransport {
 
   async sendAsync(peerId: string, message: SyncMessage): Promise<void> {
     const state = this.peerStates.get(peerId);
-    if (!state?.channelOpen || !state.channel) {
+    if (!state?.channelOpen || !state.channel || state.channel.readyState !== 'open') {
       this.send(peerId, message);
       return;
     }
     const channel = state.channel;
     if (channel.bufferedAmount > BACKPRESSURE_HIGH_WATER) {
+      channel.bufferedAmountLowThreshold = BACKPRESSURE_LOW_WATER;
       await new Promise<void>((resolve) => {
-        channel.bufferedAmountLowThreshold = BACKPRESSURE_LOW_WATER;
-        const handler = () => {
-          channel.removeEventListener('bufferedamountlow', handler);
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          channel.removeEventListener('bufferedamountlow', onSettle);
+          channel.removeEventListener('close', onSettle);
+          channel.removeEventListener('error', onSettle);
+          clearTimeout(timer);
           resolve();
         };
-        channel.addEventListener('bufferedamountlow', handler);
+        const onSettle = () => finish();
+        const timer = setTimeout(finish, BACKPRESSURE_TIMEOUT_MS);
+        channel.addEventListener('bufferedamountlow', onSettle);
+        // If the channel closes/errors while we wait, resolve too — otherwise this
+        // await (and the caller's sync loop) would hang for the whole session.
+        channel.addEventListener('close', onSettle);
+        channel.addEventListener('error', onSettle);
+        // Guard the lost-event race: the drain/close may have happened between the
+        // bufferedAmount check and attaching the listeners.
+        if (channel.readyState !== 'open' || channel.bufferedAmount <= BACKPRESSURE_LOW_WATER) {
+          finish();
+        }
       });
     }
-    this._sendOnChannel(channel, message);
+    // Only send if the channel is still usable; a dropped channel re-pulls next round.
+    if (channel.readyState === 'open') {
+      this._sendOnChannel(channel, message);
+    }
   }
 
   send(peerId: string, message: SyncMessage): void {
@@ -273,19 +347,36 @@ export class WebRTCTransport {
   }
 
   broadcast(message: SyncMessage): void {
-    for (const peerId of this.peerStates.keys()) {
-      this.send(peerId, message);
+    // Serialize the payload at most once, regardless of peer count, instead of
+    // re-stringifying the identical message per peer inside send().
+    let data: string | null = null;
+    for (const [peerId, state] of this.peerStates) {
+      if (state.channelOpen && state.channel) {
+        if (data === null) data = JSON.stringify(message);
+        state.channel.send(data);
+      } else {
+        // Not yet open — keep the existing queueing path (object queued, drained
+        // and stringified on channel open).
+        this.send(peerId, message);
+      }
     }
   }
 
   peers(): string[] {
-    return Array.from(this.peerStates.keys()).filter(
-      (id) => this.peerStates.get(id)?.channelOpen,
-    );
+    const out: string[] = [];
+    for (const [id, state] of this.peerStates) {
+      if (state.channelOpen) out.push(id);
+    }
+    return out;
   }
 
   disconnect(): void {
     this.stopped = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectAttempt = 0;
     this.ws?.close();
     for (const [peerId] of this.peerStates) {
       this._removePeer(peerId);
@@ -293,7 +384,11 @@ export class WebRTCTransport {
   }
 }
 
-function _appendRoomParam(url: string, room: string): string {
-  const sep = url.includes('?') ? '&' : '?';
-  return `${url}${sep}room=${encodeURIComponent(room)}`;
+function _appendParams(url: string, params: Record<string, string>): string {
+  let out = url;
+  for (const [key, value] of Object.entries(params)) {
+    const sep = out.includes('?') ? '&' : '?';
+    out = `${out}${sep}${key}=${encodeURIComponent(value)}`;
+  }
+  return out;
 }

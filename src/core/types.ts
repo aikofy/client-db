@@ -30,6 +30,19 @@ export interface QueryOptions<T extends Record<string, unknown> = Record<string,
   includeDeleted?: boolean;
 }
 
+/**
+ * Options for `scan()` — a streaming, bounded-memory iteration over a collection.
+ * Unlike `query()`, scan never materializes the whole collection: it pages by
+ * primary key (`_id`) and yields docs in `_id` order. There is no `orderBy`
+ * (a global sort would require buffering everything); use `query()` for that.
+ */
+export interface ScanOptions<T extends Record<string, unknown> = Record<string, unknown>> {
+  where?: WhereClause<T & SystemFields>;
+  includeDeleted?: boolean;
+  /** Docs pulled from IndexedDB per page; caps peak memory. Default 1000. */
+  batchSize?: number;
+}
+
 // ─── Change log ───────────────────────────────────────────────────────────────
 
 export type ChangeOperation = 'put' | 'delete';
@@ -108,6 +121,29 @@ export interface Snapshot {
   collections: Record<string, Doc[]>;
   meta: Record<string, unknown>;
 }
+
+// ─── Streaming snapshot chunks ────────────────────────────────────────────────
+
+/** First chunk of a streamed snapshot: metadata + HLC watermark, no docs. */
+export interface SnapshotHeaderChunk {
+  kind: 'header';
+  version: number;
+  hlc: HLCTimestamp;
+  meta: Record<string, unknown>;
+}
+
+/** A bounded page of documents for one collection (tombstones included). */
+export interface SnapshotBatchChunk {
+  kind: 'batch';
+  collection: string;
+  docs: Doc[];
+}
+
+/**
+ * A streamed snapshot is an ordered sequence: one header, then any number of
+ * batches. Producing/consuming it never holds the whole dataset in memory.
+ */
+export type SnapshotChunk = SnapshotHeaderChunk | SnapshotBatchChunk;
 
 // ─── IStorageAdapter ──────────────────────────────────────────────────────────
 

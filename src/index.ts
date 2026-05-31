@@ -9,6 +9,7 @@ export type {
   SystemFields,
   Doc,
   QueryOptions,
+  ScanOptions,
   WhereClause,
   ChangeEntry,
   ChangeOperation,
@@ -20,6 +21,9 @@ export type {
   SyncConfig,
   DBConfig,
   Snapshot,
+  SnapshotChunk,
+  SnapshotHeaderChunk,
+  SnapshotBatchChunk,
   IStorageAdapter,
   SyncMessage,
   SyncRequestMessage,
@@ -31,6 +35,11 @@ export type {
   SnapshotStreamBatchMessage,
   SnapshotStreamEndMessage,
 } from './core/types.js';
+
+export {
+  snapshotChunksToNdjsonStream,
+  ndjsonStreamToSnapshotChunks,
+} from './snapshot-stream.js';
 
 export { resolveConflict, logConflict } from './core/conflict.js';
 export { IndexedDBAdapter } from './storage/indexeddb.js';

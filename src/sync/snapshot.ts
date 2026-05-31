@@ -45,15 +45,14 @@ export async function sendSnapshotTo(
 
   for (const name of collections) {
     let batchIndex = 0;
-    let offset = 0;
+    let afterId: string | null = null;
     let done = false;
 
     while (!done) {
-      const docs = await adapter.query(name, {
-        limit: SNAPSHOT_BATCH_SIZE,
-        offset,
-        includeDeleted: true,
-      });
+      // Keyset paging by primary key: O(batch) per page, O(n) overall — vs the
+      // old growing-offset query which re-scanned all previously-sent records
+      // (O(n^2)). Same docs, same _id order, tombstones included.
+      const docs = await concreteAdapter._querySnapshotBatch(name, afterId, SNAPSHOT_BATCH_SIZE);
       done = docs.length < SNAPSHOT_BATCH_SIZE;
 
       await transport.sendAsync(peerId, {
@@ -65,7 +64,7 @@ export async function sendSnapshotTo(
         isLastBatch: done,
       } as SnapshotStreamBatchMessage);
 
-      offset += docs.length;
+      if (docs.length > 0) afterId = docs[docs.length - 1]._id;
       batchIndex++;
     }
   }
@@ -125,7 +124,15 @@ export async function handleSnapshotStreamBatch(
 ): Promise<void> {
   const state = _activeStreams.get(msg.requestId);
   if (!state) return;
-  await state.adapter.bulkInsert(msg.collection, msg.docs);
+  try {
+    await state.adapter.bulkInsert(msg.collection, msg.docs);
+  } catch (err) {
+    // A failed batch write must reject requestSnapshot (so the caller falls back
+    // to delta sync) instead of hanging the full 120s timeout.
+    clearTimeout(state.timeoutId);
+    _activeStreams.delete(msg.requestId);
+    state.reject(err as Error);
+  }
 }
 
 export async function handleSnapshotStreamEnd(
@@ -135,12 +142,32 @@ export async function handleSnapshotStreamEnd(
   const state = _activeStreams.get(msg.requestId);
   if (!state) return;
 
+  // Clear the timer + registry entry BEFORE the awaited persist so a throw there
+  // can't leave a stale entry or a timer firing against a closed adapter.
   clearTimeout(state.timeoutId);
   _activeStreams.delete(msg.requestId);
 
-  const concreteAdapter = state.adapter as IndexedDBAdapter;
-  concreteAdapter.getHLC().update(msg.hlc);
-  await concreteAdapter.persistHLC();
+  try {
+    const concreteAdapter = state.adapter as IndexedDBAdapter;
+    concreteAdapter.getHLC().update(msg.hlc);
+    await concreteAdapter.persistHLC();
+    state.resolve();
+  } catch (err) {
+    state.reject(err as Error);
+  }
+}
 
-  state.resolve();
+/**
+ * Abort and reject any in-flight snapshot receives for `adapter`. Called on
+ * stop()/close() so a teardown can't leave a 120s timer running or a hanging
+ * requestSnapshot promise. Filters by adapter so a concurrently-open DB is safe.
+ */
+export function cancelActiveStreams(adapter: IStorageAdapter): void {
+  for (const [requestId, state] of _activeStreams) {
+    if (state.adapter === adapter) {
+      clearTimeout(state.timeoutId);
+      _activeStreams.delete(requestId);
+      state.reject(new Error('Snapshot stream cancelled'));
+    }
+  }
 }
