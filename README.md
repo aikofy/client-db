@@ -4,6 +4,7 @@ A TypeScript-first, offline-ready, peer-to-peer syncing database for web browser
 
 [![npm version](https://img.shields.io/npm/v/@aikofy/client-db)](https://www.npmjs.com/package/@aikofy/client-db)
 [![license](https://img.shields.io/npm/l/@aikofy/client-db)](./LICENSE)
+[![GitHub](https://img.shields.io/badge/GitHub-aikofy%2Fclient--db-181717?logo=github)](https://github.com/aikofy/client-db)
 
 ---
 
@@ -641,9 +642,11 @@ No paywalled or proprietary dependencies.
 
 ## Contributing
 
-Contributions are welcome! Please open an issue before submitting a PR for large changes.
+Contributions are welcome! The source lives on GitHub at [aikofy/client-db](https://github.com/aikofy/client-db). Please [open an issue](https://github.com/aikofy/client-db/issues) before submitting a PR for large changes.
 
 ```bash
+git clone https://github.com/aikofy/client-db.git
+cd client-db
 bun install
 bun run test        # run tests
 bun run test:watch  # watch mode

@@ -38,6 +38,14 @@
     "vitest": "^2.0.0"
   },
   "author": "Lwin Maung Maung",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aikofy/client-db.git"
+  },
+  "homepage": "https://github.com/aikofy/client-db#readme",
+  "bugs": {
+    "url": "https://github.com/aikofy/client-db/issues"
+  },
   "publishConfig": {
     "access": "public"
   },
