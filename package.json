@@ -1,7 +1,7 @@
 {
   "name": "@aikofy/client-db",
-  "version": "1.1.0",
-  "description": "IndexedDB sync wrapper with HLC, conflict resolution, and WebRTC gossip sync",
+  "version": "2.0.0",
+  "description": "Offline-first, peer-to-peer IndexedDB sync (HLC, CRDT conflict resolution, WebRTC gossip) with a Consumer Client RPC layer for thin clients that call functions instead of replicating",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -60,7 +60,10 @@
     "webrtc",
     "hlc",
     "offline-first",
-    "crdt"
+    "crdt",
+    "rpc",
+    "consumer-client",
+    "p2p"
   ],
   "license": "MIT"
 }

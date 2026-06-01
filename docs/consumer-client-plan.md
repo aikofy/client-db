@@ -271,14 +271,21 @@ replicated cross-node idempotency dedupe store.
 **Note:** audit persistence is via the `onCall` hook (write to a replicated collection in-app);
 the server doesn't hardcode a collection.
 
-### Phase 9 — Docs, examples, release
+### Phase 9 — Docs, examples, release — ✅ DONE
 **Goal:** usable + shipped.
-**Changes:**
-- README sections: Normal Client handler authoring, Consumer SDK usage, auth setup,
-  consistency/failover notes.
-- Example app (Normal + Consumer).
-- Changelog, version bump, publish (`@aikofy/client-db` + `/consumer` subpath).
-**Risk:** low.
+**Delivered:**
+- ✅ README finalized: Consumer/RPC bullet in the feature list, the full "Consumer Clients (RPC)"
+  section (handler authoring, ConsumerClient usage, auth, writes, streaming, failover/read-your-
+  writes, hardening/audit), status reframed for 2.0.0, accurate Project Structure (`rpc/*`,
+  `backpressure.ts`, `consumer.ts`, `docs/`, `examples/`), publishing checklist references CHANGELOG.
+- ✅ `CHANGELOG.md` with the 2.0.0 entry (Consumer Client / RPC; no breaking changes to existing
+  sync APIs; signaling-server compatibility note).
+- ✅ `examples/`: `normal-client.ts` (RpcRouter handlers + `createDB({ rpc })` + verifier + onCall),
+  `consumer-client.ts` (`invoke`/`stream`), `examples/README.md`.
+- ✅ `package.json`: **version 2.0.0**, description + keywords (`rpc`, `consumer-client`, `p2p`).
+**Result:** 147/147 tests pass; `tsc` clean; dual-entry build succeeds (index 74.7 KB, consumer
+17.3 KB). NOT published — that's the maintainer's `npm publish` step.
+**Remaining external dependency:** the role-aware signaling server (`signaling-protocol.md`).
 
 ---
 

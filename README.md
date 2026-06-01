@@ -21,6 +21,9 @@ A TypeScript-first, offline-ready, peer-to-peer syncing database for web browser
 - **Soft deletes** — tombstones preserve sync integrity; deleted records are never lost
 - **Delta sync** — only changes since last sync are exchanged, not full datasets
 - **Snapshot bootstrap** — new peers receive a full snapshot then switch to delta sync automatically
+- **Consumer Clients (RPC)** — thin clients that hold no data and call a Normal Client's
+  read/write/stream functions over WebRTC (auth, scopes, idempotent writes, streaming, failover);
+  ships as a separate ~17 KB entry point. See [Consumer Clients (RPC)](#consumer-clients-rpc).
 - **Fully typed** — strict TypeScript with generics; collection access is type-safe
 - **Framework-agnostic** — plain TypeScript, works in React, Vue, Svelte, or vanilla JS
 - **Tree-shakeable** — ESM + CJS dual build via tsup
@@ -171,18 +174,18 @@ Once connected, the library:
 
 ---
 
-## Consumer Clients (RPC) — experimental
+## Consumer Clients (RPC)
 
-> **Status:** in active development. Today this supports **authenticated, scope-authorized reads
-> and writes** from a Consumer against a Normal Client — JWS tokens are verified locally with
-> WebCrypto (ES256/RS256); writes are idempotent (auto-keyed, deduped) and replicate to other
-> Normal Clients via the normal gossip pipeline; **server-streaming** is supported (async-generator
-> handlers, backpressure-aware, cancellable); a dropped Normal Client triggers **transparent
-> failover** to another candidate with **read-your-writes** preserved; and it's hardened with
-> **per-consumer rate limiting**, **payload caps**, an **observability/audit hook**, and
-> **capability/version negotiation**. The remaining work is docs, examples, and release. Requires
-> a **role-aware signaling server** — see
-> [`docs/signaling-protocol.md`](./docs/signaling-protocol.md). Full design:
+> **New in 2.0.0.** Authenticated, scope-authorized **reads, writes, and server-streaming** from a
+> Consumer against a Normal Client: JWS tokens verified locally with WebCrypto (ES256/RS256);
+> idempotent writes that replicate via the normal gossip pipeline; backpressure-aware, cancellable
+> streams; transparent **failover** to another Normal Client with **read-your-writes** preserved;
+> and **per-consumer rate limiting**, payload caps, an observability/audit hook, and
+> capability/version negotiation.
+>
+> **Requires a role-aware signaling server** to broker Consumer connections — see
+> [`docs/signaling-protocol.md`](./docs/signaling-protocol.md) (Normal-Client-only sync is
+> unaffected and needs no server change). Full design:
 > [`docs/consumer-client-plan.md`](./docs/consumer-client-plan.md),
 > [`docs/rpc-protocol.md`](./docs/rpc-protocol.md).
 
@@ -191,7 +194,7 @@ controlled API surface instead of replicating the whole database:
 
 - **Normal Client** — the standard `createDB` client (full replica + gossip). It can *additionally*
   act as an **RPC server**, exposing named read/write functions ("handlers") over WebRTC.
-- **Consumer Client** — a thin client (`@aikofy/client-db/consumer`, ~10 KB) that holds **no data**
+- **Consumer Client** — a thin client (`@aikofy/client-db/consumer`, ~17 KB) that holds **no data**
   and never gossips. It authenticates and *calls* a Normal Client's handlers. Think "frontend
   calling a backend," but the wire is a WebRTC data channel instead of HTTP.
 
@@ -343,7 +346,7 @@ const db = await createDB({
 });
 ```
 
-Limits are configurable via `rpc` (`idempotencyTtlMs`, `readAfterTimeoutMs`) and the server's
+Limits are configurable on the `rpc` option: `idempotencyTtlMs`, `readAfterTimeoutMs`, and
 `limits` (`maxPayloadBytes`, `defaultDeadlineMs`, `rateLimit.perMin`).
 
 ---
@@ -776,8 +779,8 @@ function useTodos(userId: string) {
 
 Before publishing to npm:
 
-1. Bump `version` in `package.json`
-2. `bun run build` — verify `dist/` is clean
+1. Bump `version` in `package.json` and add a `CHANGELOG.md` entry
+2. `bun run build` — verify `dist/` is clean (builds both the `.` and `./consumer` entries)
 3. `bun run test` — all tests pass
 4. `bun run typecheck` — no type errors
 5. `npm publish --access public` (or `bun publish`)
@@ -800,15 +803,21 @@ src/
     webrtc-transport.ts  # WebRTC + WebSocket signaling (room-aware; isolates consumer 'rpc' channels)
     gossip.ts            # Gossip sync protocol (K=3 fanout, 30s interval, real-time push)
     snapshot.ts          # Snapshot export / import / chunking
-  rpc/                # Consumer RPC layer (experimental)
+    backpressure.ts      # Data-channel backpressure (shared by gossip + RPC streaming)
+  rpc/                # Consumer RPC layer
     protocol.ts          # Wire frames + status codes (docs/rpc-protocol.md)
     router.ts            # RpcRouter — register read/write/stream handlers
     server.ts            # RpcServer — dispatch handlers (runs on Normal Clients)
     client.ts            # RpcClient — transport-agnostic caller (used by ConsumerClient)
+    auth.ts              # createTokenVerifier — WebCrypto JWS verification
+    idempotency.ts       # run-once dedupe for writes
+    middleware.ts        # TokenBucket rate limit, payload sizing, CallRecord
     context.ts, errors.ts
   db.ts               # createDB() factory + CollectionProxy (+ optional rpc server)
   consumer.ts         # ConsumerClient — slim entry: @aikofy/client-db/consumer
   index.ts            # Public exports
+docs/                 # Consumer-client design + wire-protocol specs
+examples/             # Normal-client / consumer-client usage examples
 ```
 
 ---

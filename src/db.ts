@@ -33,6 +33,11 @@ export interface RpcConfig {
   verifyToken?: TokenVerifier;
   /** TTL (ms) for the write idempotency dedupe cache. Default 10 min. */
   idempotencyTtlMs?: number;
+  /** Max time (ms) to wait for the local replica to catch up to a request's `readAfter`
+   *  watermark before replying UNAVAILABLE. Default 2000. */
+  readAfterTimeoutMs?: number;
+  /** Override server limits: `maxPayloadBytes`, `defaultDeadlineMs`, `rateLimit.perMin`. */
+  limits?: RpcServerConfig['limits'];
   /** Observability hook — invoked once per Consumer call (metrics/audit). */
   onCall?: RpcServerConfig['onCall'];
 }
@@ -212,6 +217,8 @@ async function _createDB<C extends Record<string, CollectionSchema>>(
         sendAsync: (id, frame) => transport!.sendToConsumerAsync(id, frame),
         verifyToken: config.rpc.verifyToken,
         idempotencyTtlMs: config.rpc.idempotencyTtlMs,
+        readAfterTimeoutMs: config.rpc.readAfterTimeoutMs,
+        limits: config.rpc.limits,
         onCall: config.rpc.onCall,
       });
       transport.onConsumerConnected = (id) => rpcServer.onConnect(id);
