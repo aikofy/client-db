@@ -11,6 +11,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
+    },
+    "./consumer": {
+      "types": "./dist/consumer.d.ts",
+      "import": "./dist/consumer.js",
+      "require": "./dist/consumer.cjs"
     }
   },
   "files": [

@@ -1,5 +1,8 @@
 export { createDB } from './db.js';
-export type { TypedDB, DBBase, CollectionProxy, SyncStatus } from './db.js';
+export type { TypedDB, DBBase, CollectionProxy, SyncStatus, RpcConfig } from './db.js';
+
+// RPC server: define read/write/stream handlers a Normal Client exposes to Consumers.
+export * from './rpc/index.js';
 
 export { HLC, parseHLC, formatHLC } from './core/hlc.js';
 export type { HLCState } from './core/hlc.js';

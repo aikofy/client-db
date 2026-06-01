@@ -1,6 +1,9 @@
 import { IndexedDBAdapter } from './storage/indexeddb.js';
 import { WebRTCTransport } from './sync/webrtc-transport.js';
 import { GossipSync } from './sync/gossip.js';
+import { RpcServer } from './rpc/server.js';
+import type { RpcRouter } from './rpc/router.js';
+import type { TokenVerifier } from './rpc/server.js';
 import type {
   DBConfig,
   Doc,
@@ -14,6 +17,23 @@ import type {
 } from './core/types.js';
 
 export type SyncStatus = 'online' | 'offline' | 'syncing';
+
+/**
+ * Turns a Normal Client into an RPC server for Consumer Clients. `router` holds the
+ * read/write/stream handlers consumers may call. Requires `sync` (consumers connect over the
+ * same WebRTC transport); ignored if `sync` is absent.
+ */
+export interface RpcConfig {
+  router: RpcRouter;
+  /**
+   * Verifies a Consumer's token → identity (e.g. from `createTokenVerifier`). If omitted, every
+   * connection is trusted as `{ id: consumerId, scopes: [] }` — DEV ONLY; handlers with declared
+   * `scopes` will be denied since a trusted stub identity carries none.
+   */
+  verifyToken?: TokenVerifier;
+  /** TTL (ms) for the write idempotency dedupe cache. Default 10 min. */
+  idempotencyTtlMs?: number;
+}
 
 type ChangeCallback = (changes: ChangeEntry[]) => void;
 
@@ -94,7 +114,7 @@ function makeCollectionProxy<T extends Record<string, unknown>>(
 const _openDbs = new Map<string, Promise<unknown>>();
 
 export function createDB<C extends Record<string, CollectionSchema>>(
-  config: DBConfig & { collections: C },
+  config: DBConfig & { collections: C; rpc?: RpcConfig },
 ): Promise<TypedDB<C>> {
   const existing = _openDbs.get(config.name);
   if (existing) return existing as Promise<TypedDB<C>>;
@@ -105,7 +125,7 @@ export function createDB<C extends Record<string, CollectionSchema>>(
 }
 
 async function _createDB<C extends Record<string, CollectionSchema>>(
-  config: DBConfig & { collections: C },
+  config: DBConfig & { collections: C; rpc?: RpcConfig },
 ): Promise<TypedDB<C>> {
   const adapter = new IndexedDBAdapter(config.name, config.version, config.collections);
   await adapter.open();
@@ -136,7 +156,11 @@ async function _createDB<C extends Record<string, CollectionSchema>>(
       iceServers: config.sync.iceServers,
       nodeId: config.sync.nodeId ?? nodeId,
       room: config.name,
+      serveConsumers: config.sync.serveConsumers,
     });
+    // Consumer ('rpc') connections are isolated from gossip by the transport. The RPC
+    // server that handles transport.onConsumer{Connected,Disconnected,Message} is wired
+    // in Phase 2; until then a connecting consumer simply has no handlers to call.
 
     gossip = new GossipSync(
       transport,
@@ -173,6 +197,24 @@ async function _createDB<C extends Record<string, CollectionSchema>>(
 
     transport.connect();
     gossip.start();
+
+    // Serve Consumer Clients: route the transport's isolated 'rpc' connections to the RPC
+    // server. Consumers never enter gossip (Phase 1), so this only ever sees consumer frames.
+    if (config.rpc) {
+      const rpcServer = new RpcServer({
+        router: config.rpc.router,
+        adapter,
+        hlc: () => adapter.getHLC().now(),
+        nodeId: config.sync.nodeId ?? nodeId,
+        send: (id, frame) => transport!.sendToConsumer(id, frame),
+        sendAsync: (id, frame) => transport!.sendToConsumerAsync(id, frame),
+        verifyToken: config.rpc.verifyToken,
+        idempotencyTtlMs: config.rpc.idempotencyTtlMs,
+      });
+      transport.onConsumerConnected = (id) => rpcServer.onConnect(id);
+      transport.onConsumerDisconnected = (id) => rpcServer.onDisconnect(id);
+      transport.onConsumerMessage = (id, data) => { void rpcServer.handleMessage(id, data); };
+    }
 
     if (typeof window !== 'undefined') {
       syncStatus = navigator.onLine ? 'online' : 'offline';

@@ -102,6 +102,10 @@ export interface SyncConfig {
    *  Peers with a watermark older than this TTL receive needsFullSync and re-bootstrap.
    *  Default: 30. Set to 0 to disable pruning. */
   changeLogTtlDays?: number;
+  /** Whether this Normal Client accepts Consumer ('rpc') connections and serves their
+   *  RPC calls. Advertised to the signaling server for load-balancer eligibility.
+   *  Default: true. (Consumer RPC handling itself lands in Phase 2.) */
+  serveConsumers?: boolean;
 }
 
 // ─── DB config ────────────────────────────────────────────────────────────────

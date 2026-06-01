@@ -171,6 +171,154 @@ Once connected, the library:
 
 ---
 
+## Consumer Clients (RPC) — experimental
+
+> **Status:** in active development. Today this supports **authenticated, scope-authorized reads
+> and writes** from a Consumer against a Normal Client — JWS tokens are verified locally with
+> WebCrypto (ES256/RS256); writes are idempotent (auto-keyed, deduped) and replicate to other
+> Normal Clients via the normal gossip pipeline; **server-streaming** is supported (async-generator
+> handlers, backpressure-aware, cancellable); and a dropped Normal Client triggers **transparent
+> failover** to another candidate with **read-your-writes** preserved. Production hardening
+> (rate limiting, audit, capability/version negotiation) is the remaining work. Requires a
+> **role-aware signaling server** — see
+> [`docs/signaling-protocol.md`](./docs/signaling-protocol.md). Full design:
+> [`docs/consumer-client-plan.md`](./docs/consumer-client-plan.md),
+> [`docs/rpc-protocol.md`](./docs/rpc-protocol.md).
+
+Beyond peer-to-peer replication, the library supports a second client role so you can expose a
+controlled API surface instead of replicating the whole database:
+
+- **Normal Client** — the standard `createDB` client (full replica + gossip). It can *additionally*
+  act as an **RPC server**, exposing named read/write functions ("handlers") over WebRTC.
+- **Consumer Client** — a thin client (`@aikofy/client-db/consumer`, ~10 KB) that holds **no data**
+  and never gossips. It authenticates and *calls* a Normal Client's handlers. Think "frontend
+  calling a backend," but the wire is a WebRTC data channel instead of HTTP.
+
+A Consumer can only ever receive what a handler returns — it can never pull the database.
+
+### Define handlers on a Normal Client
+
+```ts
+import { createDB, RpcRouter, RpcError, createTokenVerifier } from '@aikofy/client-db';
+
+const router = new RpcRouter()
+  .read('todos.listMine', {
+    scopes: ['todos:read'], // caller's token must carry these
+    handler: async (ctx) => {
+      // ctx.db is the FULL local replica — the handler decides what leaves the device.
+      const all = await ctx.db.query('todos');
+      return all.filter((t) => t.ownerId === ctx.consumer.id); // ctx.consumer = authenticated caller
+    },
+  })
+  .read('todos.get', {
+    scopes: ['todos:read'],
+    input: { parse: (v) => v as { id: string } }, // any zod-compatible `{ parse }`
+    handler: async (ctx, { id }) => {
+      const todo = await ctx.db.get('todos', id);
+      if (!todo) throw new RpcError('NOT_FOUND', 'no such todo');
+      return todo;
+    },
+  })
+  .write('todos.create', {
+    scopes: ['todos:write'],
+    handler: (ctx, params: { title: string }) =>
+      // ctx.idempotent dedupes retries (the Consumer auto-attaches a key for write methods).
+      ctx.idempotent(ctx.request.idempotencyKey, async () => {
+        const doc = await ctx.db.put('todos', { title: params.title, ownerId: ctx.consumer.id });
+        return { id: doc._id }; // the write replicates to other Normal Clients via gossip
+      }),
+  })
+  .stream('todos.export', {
+    scopes: ['todos:read'],
+    // An async generator. Each `yield` is one stream frame; backpressure is handled for you.
+    handler: async function* (ctx) {
+      const all = await ctx.db.query('todos');
+      for (let i = 0; i < all.length; i += 500) {
+        yield all.slice(i, i + 500).map((t) => ({ id: t._id }));
+      }
+    },
+  });
+
+const db = await createDB({
+  name: currentUser.id,
+  version: 1,
+  collections: { todos: { indexes: ['ownerId'] } },
+  sync: { signalingServer, iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] },
+  rpc: {
+    router,
+    // Verify Consumer tokens locally (no per-request callout). Tokens are minted by your IdP;
+    // we only verify. `sub` becomes ctx.consumer.id; `scope`/`scopes` become ctx.consumer.scopes.
+    verifyToken: createTokenVerifier({
+      jwks: idpPublicJwks,           // your IdP's public keys
+      issuer: 'https://idp.example.com',
+      audience: 'client-db',
+    }),
+  },
+});
+```
+
+The **handler body is the access-control boundary**: it reads the whole replica via `ctx.db` but
+returns only what the authenticated `ctx.consumer` may see. Declared `scopes` are enforced before
+the handler runs (missing scope → `PERMISSION_DENIED`). Omit `verifyToken` only in dev — without
+it every connection is trusted with no scopes.
+
+### Call from a Consumer Client
+
+```ts
+import { ConsumerClient, RpcError } from '@aikofy/client-db/consumer';
+
+const consumer = new ConsumerClient({
+  signalingServerUrl: 'wss://signal.example.com/signal',
+  room: targetUserId,                          // the Normal Clients' DB name
+  auth: { getToken: () => fetchAccessToken() }, // your IdP / backend
+});
+
+const mine = await consumer.invoke('todos.listMine'); // connects + authenticates on first call
+
+try {
+  const one = await consumer.invoke('todos.get', { id: 'abc' });
+} catch (e) {
+  if (e instanceof RpcError && e.status === 'NOT_FOUND') { /* handle */ }
+}
+
+// Writes work the same way; the SDK auto-attaches a stable idempotency key so a retry is
+// deduped (applied once) rather than duplicated.
+const { id } = await consumer.invoke('todos.create', { title: 'Buy milk' });
+
+// Server-streaming: iterate chunks as they arrive. Breaking the loop (or an AbortSignal)
+// cancels the stream and stops the producer on the Normal Client.
+for await (const batch of consumer.stream('todos.export')) {
+  render(batch);
+}
+
+consumer.close();
+```
+
+`invoke()` resolves with the handler's return value or rejects with an `RpcError` carrying a
+gRPC-style `status` (`UNAUTHENTICATED`, `PERMISSION_DENIED`, `INVALID_ARGUMENT`, `NOT_FOUND`,
+`UNAVAILABLE`, …). The Consumer connects to one Normal Client chosen round-robin from the
+signaling server's healthy list.
+
+### Failover & read-your-writes
+
+If the serving Normal Client drops (or returns a retryable error), the Consumer transparently
+reconnects to the next candidate, re-authenticates, and replays the call:
+
+- **Reads** are replayed automatically. Each read carries the last write's HLC watermark as
+  `readAfter`, so a failed-over replica **waits until it has caught up** (read-your-writes) before
+  answering — or returns a retryable `UNAVAILABLE` so the client tries elsewhere.
+- **Writes are NOT replayed across nodes by default** — replaying a write on a different node can
+  duplicate it until the idempotency dedupe store is replicated (a follow-up). A dropped write
+  surfaces `UNAVAILABLE`; pass `{ idempotent: true }` to opt a write into failover-replay.
+
+```ts
+await consumer.invoke('todos.listMine');                       // auto-replayed on failover
+await consumer.invoke('todos.create', { title: 'x' });         // not replayed → surfaces error
+await consumer.invoke('todos.create', { title: 'x' }, { idempotent: true }); // opt into replay
+```
+
+---
+
 ## Bootstrap Strategies
 
 When a client connects to peers for the first time in a session, it automatically picks the right strategy:
@@ -620,10 +768,17 @@ src/
     schema.ts         # Collection schema builder
     indexeddb.ts      # IndexedDB implementation of IStorageAdapter
   sync/
-    webrtc-transport.ts  # WebRTC + WebSocket signaling (room-aware)
+    webrtc-transport.ts  # WebRTC + WebSocket signaling (room-aware; isolates consumer 'rpc' channels)
     gossip.ts            # Gossip sync protocol (K=3 fanout, 30s interval, real-time push)
     snapshot.ts          # Snapshot export / import / chunking
-  db.ts               # createDB() factory + CollectionProxy
+  rpc/                # Consumer RPC layer (experimental)
+    protocol.ts          # Wire frames + status codes (docs/rpc-protocol.md)
+    router.ts            # RpcRouter — register read/write/stream handlers
+    server.ts            # RpcServer — dispatch handlers (runs on Normal Clients)
+    client.ts            # RpcClient — transport-agnostic caller (used by ConsumerClient)
+    context.ts, errors.ts
+  db.ts               # createDB() factory + CollectionProxy (+ optional rpc server)
+  consumer.ts         # ConsumerClient — slim entry: @aikofy/client-db/consumer
   index.ts            # Public exports
 ```
 

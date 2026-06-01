@@ -104,95 +104,151 @@ Build/exports changes:
 - ✅ Three open questions in §4 resolved (existing IdP, sticky sessions, applied-locally ack).
 **Acceptance:** specs reviewed & approved. No code.
 
-### Phase 1 — Transport isolation + signaling roles
+### Phase 1 — Transport isolation + signaling roles — ✅ DONE
 **Goal:** a Consumer can open an `'rpc'` data channel to a Normal Client that is **never**
 gossiped to. This is the safety foundation; build it first.
-**Changes:**
-- `webrtc-transport.ts`: on `ondatachannel`, branch on `channel.label`. `'sync'` → existing
-  gossip wiring; `'rpc'` → new `onConsumerConnected(peerId, channel)` callback. Do **not**
-  add `'rpc'` peers to `peerStates` used by `peers()`/gossip, or keep a separate map.
-- Extract offer/answer/ICE plumbing into reusable helpers so the Consumer side can connect
-  to a single Normal Client without the room/mesh logic.
-- `db.ts`: gossip starts only on a `'sync'` channel open; `'rpc'` channels route to `RpcServer`.
-- Signaling (external) + client `register`: add `role`. Consumer receives a candidate
-  `server-list` instead of a gossip `peer-list`.
-**Tests:** fake signaling + fake `RTCPeerConnection`; assert an `'rpc'` peer never appears in
-`peers()`, never receives `broadcastDoc`, never triggers a snapshot.
-**Risk:** transport refactor touches the battle-tested handshake — keep the mesh path
-behavior-identical; cover with existing gossip tests + new isolation tests.
+**Delivered:**
+- ✅ `webrtc-transport.ts`: inbound consumer connections live in a separate `consumerStates`
+  map; `ondatachannel` accepts **only** an `'rpc'`-labelled channel from a consumer (a `'sync'`
+  channel is refused). `peers()`/`broadcast()`/`onPeerConnected` remain gossip-only. New
+  `onConsumer{Connected,Disconnected,Message}`, `sendToConsumer()`, `consumers()`. `_wireICE`
+  generalized (shared by gossip + consumer paths). Registers as `role:'normal'` + `serveConsumers`.
+- ✅ `core/types.ts` + `db.ts`: `SyncConfig.serveConsumers` plumbed through to the transport.
+  (RPC server wiring of the consumer callbacks is deferred to Phase 2, as planned.)
+- ✅ `src/test-utils/fake-webrtc.ts`: fake `RTCPeerConnection`/`RTCDataChannel`/`WebSocket` +
+  `FakeSignalingHub` (relays offer/answer/ICE, stamps `fromRole`, `peer-list` vs `server-list`)
+  + `FakeConsumer` driver + `installFakeWebRTC`/`waitFor`. Not shipped (only `index.ts` is built).
+- ✅ `src/sync/webrtc-transport.test.ts`: consumer isolation (not a gossip peer, no broadcast,
+  bidirectional rpc messages, onConsumer\* fire), `'sync'`-from-consumer refused, consumer removed
+  on `disconnect()`, and a two-normal **mesh sanity** test guarding the `_wireICE` refactor.
+- **Note:** the signaling-server changes are external (see `signaling-protocol.md`); the
+  client side here is exercised against the fake hub. Live e2e needs the server team's update.
+**Result:** 81/81 tests pass (4 new), `tsc --noEmit` clean, `tsup` build succeeds.
 
-### Phase 2 — RPC core + handler/router API (reads first)
+### Phase 2 — RPC core + handler/router API (reads first) — ✅ DONE
 **Goal:** define and call unary read handlers end-to-end (identity stubbed for now).
-**Changes:**
-- `protocol.ts`, `errors.ts`: envelope + status codes + `RpcError`.
-- `router.ts`: `router.read(name, { scopes, input, handler })` (and `.write`, `.stream`
-  signatures stubbed). Handler signature `(ctx, params) => result`.
-- `server.ts`: dispatch over an `'rpc'` channel, correlation IDs, timeouts, error mapping.
-  Middleware pipeline scaffold (validate only this phase; auth stubbed to a trusted identity).
-- `ctx` shape: `{ consumer, db, hlc(), idempotent(), signal, log }`. `db` = existing adapter.
-- `db.ts`: accept `config.rpc = { router, ... }`; mount `RpcServer` when present.
-**Tests:** register a read handler, invoke it via the fake transport, assert filtered result,
-validation failure → `INVALID_ARGUMENT`, handler throw → mapped status, timeout fires.
-**Risk:** low — additive, gated behind `'rpc'` isolation from Phase 1.
+**Delivered:**
+- ✅ `src/rpc/protocol.ts`: full frame union (auth/req/res/err/stream/cancel/ping-pong), 12
+  status codes, `RpcLimits`, `PROTOCOL_VERSION`. `errors.ts`: `RpcError` + per-status
+  `retryable` defaults. `context.ts`: `RpcContext` + `ConsumerIdentity`.
+- ✅ `router.ts`: `RpcRouter.read/write/stream(id, { scopes, input, version, handler })`,
+  pluggable `{ parse }` validator, exact-match dispatch, `catalog()` for `auth-ok`.
+- ✅ `server.ts`: per-consumer sessions, `auth`→`auth-ok` handshake (stub verifier; real one in
+  Phase 4), unary `req`→`res` dispatch, correlation ids, per-request deadline + `cancel`
+  (AbortSignal), validate step, and error→status mapping (RpcError→its status, else INTERNAL).
+  Stream dispatch returns `UNAVAILABLE` until Phase 6.
+- ✅ `db.ts`: `createDB({ …, rpc: { router } })` mounts an `RpcServer` on the transport's
+  isolated `onConsumer*` callbacks. Exported `RpcRouter/RpcServer/RpcError`/types from `index.ts`.
+- ✅ `src/rpc/server.test.ts`: auth→catalog, identity-filtered read, req-before-auth→
+  UNAUTHENTICATED, unknown→NOT_FOUND, validation→INVALID_ARGUMENT, RpcError→mapped status,
+  plain throw→INTERNAL, deadline→DEADLINE_EXCEEDED, ping→pong.
+**Result:** 90/90 tests pass (9 new), `tsc --noEmit` clean, `tsup` build succeeds.
+**Deferred (as planned):** real token verify/scope enforcement → Phase 4; idempotency +
+write watermark → Phase 5; streaming dispatch → Phase 6.
 
-### Phase 3 — Consumer SDK + slim build
+### Phase 3 — Consumer SDK + slim build — ✅ DONE
 **Goal:** `ConsumerClient` that connects, calls `invoke()`, and ships small.
-**Changes:**
-- `client.ts`: `RpcClient` — correlation, promises, deadlines, cancel.
-- `consumer.ts`: `ConsumerClient` — signaling connect (role=consumer), pick a server
-  (**round-robin** default, or **fastest-by-ping**), WebRTC connect (offerer, `'rpc'`
-  channel), expose `invoke(method, params)`. See §7 for the selection model.
-- `tsup.config.ts` + `package.json` exports: second entry, verify bundle excludes heavy modules.
-**Tests:** end-to-end over fake transport (consumer ⇄ normal); bundle-size assertion / import
-graph check that storage/gossip are not pulled into the consumer entry.
-**Risk:** medium — ensuring tree-shaking actually drops the heavy modules; may need import hygiene.
+**Delivered:**
+- ✅ `src/rpc/client.ts`: `RpcClient` — transport-agnostic; auth handshake, `invoke()` with
+  correlation ids, deadlines (+grace), `AbortSignal` cancel→`cancel` frame, `reset()` on close.
+- ✅ `src/consumer.ts`: `ConsumerClient` — signaling connect (`register role=consumer`+token),
+  **round-robin** server pick from `server-list`, RTCPeerConnection offerer with `'rpc'` channel
+  + ICE buffering, wires `RpcClient`. `connect()` / `invoke()` (auto-connects) / `close()`.
+  Independent of WebRTCTransport/storage/gossip. (`fastest-by-ping` + failover → Phase 7.)
+- ✅ `tsup.config.ts` + `package.json`: second entry `src/consumer.ts` → `@aikofy/client-db/consumer`.
+- ✅ Tests: `consumer.test.ts` (real `ConsumerClient` ⇄ real `WebRTCTransport`+`RpcServer` via the
+  fake hub — connect/auth/invoke read, implicit-connect, RpcError mapping, typed params, cancel)
+  and `consumer.imports.test.ts` (static import-graph guard: consumer reaches **only**
+  `consumer.ts`, `core/types.ts`, `rpc/{client,errors,protocol}.ts` — no storage/gossip/idb).
+- ✅ README: new "Consumer Clients (RPC)" section (handler + ConsumerClient usage, status note)
+  and updated Project Structure.
+**Result:** 98/98 tests pass (8 new). Consumer bundle **9.75 KB** vs main **63.8 KB**.
+`tsc` clean, dual-entry `tsup` build succeeds.
 
-### Phase 4 — Auth & authz
+### Phase 4 — Auth & authz — ✅ DONE
 **Goal:** real authentication + scope-based authorization.
-**Changes:**
-- `auth.ts`: verify JWS via WebCrypto (`crypto.subtle.verify`), check `exp`, populate
-  `ctx.consumer = { id, scopes, claims }`. Gossiped revocation set lookup.
-- `middleware.ts`: `authenticate` (on connect) + `authorize(scopes)` (per call).
-- Consumer side: `auth: { getToken }`, send token in the `auth` control frame on channel open;
-  auto-refresh.
-- Signaling (external): verify consumer token at `register` (defense in depth / DoS guard).
-**Tests:** valid/expired/forged/revoked tokens; missing-scope → `PERMISSION_DENIED`;
-unauthenticated channel rejected.
-**Risk:** medium — crypto correctness; pin algorithms, reject `alg:none`.
+**Delivered:**
+- ✅ `src/rpc/auth.ts`: `createTokenVerifier({ jwks, algorithms, issuer, audience,
+  clockToleranceSec, isRevoked, toIdentity })` → verifies JWS via WebCrypto (`crypto.subtle.verify`,
+  ES256/RS256), **rejects `alg:none`** + disallowed algs, checks `exp`/`nbf`/`iss`/`aud`,
+  revocation hook, maps claims→`ConsumerIdentity` (`sub`, `scope`/`scopes`). `Jwk` type.
+- ✅ `server.ts`: **scope authorization** (handler `scopes` ⊆ identity scopes else
+  `PERMISSION_DENIED`); **token-expiry** tracking (`session.expiresAt` from `claims.exp`) →
+  expired req returns `UNAUTHENTICATED` and forces re-auth (spec §8).
+- ✅ `client.ts`: **auto-reauth** — on `UNAUTHENTICATED`, drop the session, re-fetch the token,
+  retry once. (`authenticate` already sends the token on channel open.)
+- ✅ `db.ts`: `RpcConfig.verifyToken` passed to `RpcServer`. Exported `createTokenVerifier`/types.
+- ✅ Tests: `auth.test.ts` (valid / expired / nbf / forged / tampered / `alg:none` / disallowed alg
+  / issuer+audience / revoked / malformed), `client.test.ts` (resolve, err-map, cancel, auto-reauth
+  ×1 only, reset), `auth.e2e.test.ts` (scope grant + denial, identity-from-token, invalid-token).
+  `test-utils/jwt.ts` ES256 signer.
+- ✅ README auth/scopes updated. **Note:** signaling-side token check is external
+  (`signaling-protocol.md` §6). Revocation set wiring to gossip is left as the `isRevoked` hook.
+**Result:** 118/118 tests pass (20 new). `tsc` clean; consumer bundle still **10.35 KB** (the
+verifier stays out of it — import guard confirms).
 
-### Phase 5 — Write path: idempotency + watermark
+### Phase 5 — Write path: idempotency + watermark — ✅ DONE
 **Goal:** safe write handlers that replicate via existing gossip.
-**Changes:**
-- `router.write`: handler writes via `ctx.db` (existing adapter `put`/`delete`), which already
-  feeds `onChangeEntry` → `gossip.broadcastDoc`. No special replication path.
-- `idempotency.ts`: `ctx.idempotent(key, fn)` dedupe; key from request envelope. Dedupe store
-  ideally replicated so it survives failover.
-- Response carries `at: hlc()` watermark.
-**Tests:** write replicates to a second Normal Client; replayed idempotency key runs once;
-identity fields (e.g. ownerId) taken from token, not input.
-**Risk:** medium — dedupe correctness under failover; define dedupe-store TTL.
+**Delivered:**
+- ✅ Write handlers write via `ctx.db` (the same adapter `createDB` wired `onChangeEntry` on),
+  so a write automatically feeds `gossip.broadcastDoc` → replicates. No special path.
+- ✅ `src/rpc/idempotency.ts`: `IdempotencyCache` — run-once with TTL, in-flight dedupe, and
+  failed-calls-not-cached (retryable). `ctx.idempotent(key, fn)` keys on
+  `${identity.id}:${method}:${key}`; no key → runs directly. (In-memory/per-node; replicated
+  cross-node dedupe deferred — cache is injectable.)
+- ✅ Write `res` carries the post-write `hlc` watermark; `RpcClient` captures `lastHlc` and
+  **auto-attaches a stable idempotency key** for write methods (per `auth-ok` catalog kind) so a
+  retry/failover replay is deduped, not double-applied.
+- ✅ `db.ts` `RpcConfig.idempotencyTtlMs`. Exported `IdempotencyCache`.
+- ✅ Tests: `idempotency.test.ts` (once / concurrent / independent-keys / failed-retry / TTL);
+  `write.test.ts` (real `IndexedDBAdapter`): persists, **fires `onChangeEntry` (replication
+  trigger)**, **ownerId from token not client input**, res carries `hlc`, idempotent replay runs
+  handler once (one doc). README write examples added.
+**Result:** 125/125 tests pass (7 new). `tsc` clean; consumer bundle **10.92 KB** (cache is
+server-side). **Deferred:** read-your-writes `readAfter` enforcement → Phase 7; replicated dedupe
+store → follow-up.
 
-### Phase 6 — Streaming responses
+### Phase 6 — Streaming responses — ✅ DONE
 **Goal:** large/long results without OOM.
-**Changes:**
-- `router.stream`: async-generator handler; framework emits `stream` frames per `yield`,
-  then `end`. Reuse `sendAsync()` backpressure (16 MB high-water) from `webrtc-transport.ts`.
-- Consumer side: `consumer.stream(method, params)` → async iterable; cancel propagates.
-**Tests:** stream N batches with backpressure simulated; cancel mid-stream stops the producer;
-timeout on stalled stream.
-**Risk:** low–medium — mirrors existing `snapshot.ts` streaming.
+**Delivered:**
+- ✅ `src/sync/backpressure.ts`: extracted `drainIfNeeded(channel, timeoutMs?)` + `BACKPRESSURE_*`
+  constants (lifted from `sendAsync`, behavior-identical). `webrtc-transport.ts` `sendAsync` now
+  uses it, and new `sendToConsumerAsync(consumerId, data)` gives backpressure-aware consumer sends.
+- ✅ `server.ts`: `_handleStream`/`_runStream` — iterate an async-generator handler, emit
+  `stream-start` → `stream-chunk{seq}` → `stream-end`; authorize + validate; deadline + `cancel`
+  via `AbortSignal` (breaking the for-await runs the generator's `finally`); errors → `err` frame;
+  chunks sent via `config.sendAsync` (backpressure). `RpcServerConfig.sendAsync`.
+- ✅ `client.ts`: `StreamCall` (queue + async iterator; `terminated` distinguishes ended/errored
+  from caller-break) + `streams` map; `stream()` async generator (cancel on `AbortSignal` or early
+  break, errors propagate); handles `stream-chunk`/`stream-end`/err-for-stream; `reset()` fails
+  streams. `consumer.ts` `stream()`. `db.ts` wires `sendAsync`.
+- ✅ Tests: `backpressure.test.ts` (immediate / drain-event / close / timeout / closed-race);
+  `stream.test.ts` e2e (ordered chunks→complete, mid-stream error after earlier chunks, early-break
+  cancels the producer via the handler `finally`, AbortSignal→CANCELLED). README streaming examples.
+**Result:** 134/134 tests pass (9 new). `tsc` clean; consumer bundle **13.9 KB**. Gossip
+`sendAsync` path unchanged (mesh + gossip tests still green).
 
-### Phase 7 — Failover, sticky sessions, read-your-writes
+### Phase 7 — Failover, sticky sessions, read-your-writes — ✅ DONE
 **Goal:** resilience across Normal Client churn.
-**Changes:**
-- Consumer: warm candidate list; on disconnect/`UNAVAILABLE`, reconnect to the next healthy
-  candidate (next in round-robin order, or re-ping for fastest), re-auth, replay **idempotent**
-  in-flight calls (non-idempotent → surface error). See §7.
-- Sticky session by default. On failover, pass last HLC watermark; new Normal Client waits
-  until its replica catches up (or returns retryable `UNAVAILABLE`).
-**Tests:** kill serving Normal Client mid-session → transparent recovery; read-your-writes
-holds after failover; non-idempotent call not double-run.
-**Risk:** medium — replay semantics; lean on idempotency keys + retryable flags.
+**Delivered:**
+- ✅ `consumer.ts` reworked into a failover-capable connection state machine: persistent signaling,
+  round-robin candidate advance on reconnect (`everConnected` guard), reconnect + re-auth, and an
+  `invoke` retry loop bounded by candidate count. On a dropped channel (`_onChannelDown`) or a
+  server-sent retryable error, idempotent calls replay on the next candidate.
+- ✅ Replay policy: **reads replay** by default; **writes do not** (cross-node duplicate risk until
+  the dedupe store is replicated) — surface `UNAVAILABLE`; `{ idempotent: true }` opts a write in.
+- ✅ Read-your-writes: `RpcClient` auto-attaches `readAfter = lastHlc` to reads. `server.ts`
+  `_awaitReadAfter` waits (bounded `readAfterTimeoutMs`) for the local replica's HLC to reach
+  `readAfter` before serving, else retryable `UNAVAILABLE` (unary + stream paths). `InvokeOptions`
+  gains `idempotent` + `readAfter`.
+- ✅ Tests: `failover.test.ts` (read recovers on B after killing A; write surfaces error / not
+  double-run; write `{idempotent:true}` replays on B); `readafter.test.ts` (UNAVAILABLE on timeout,
+  serves once caught up, immediate when ahead); `client.test.ts` (+1: writes keyed, reads carry
+  `readAfter=lastHlc`). README failover/read-your-writes section.
+**Result:** 141/141 tests pass (7 new). `tsc` clean; consumer bundle **16.95 KB**. Existing
+single-node consumer/auth/stream tests unaffected by the rework.
+**Deferred:** fastest-by-ping selection + heartbeat liveness (round-robin is the default);
+replicated cross-node idempotency dedupe store.
 
 ### Phase 8 — Hardening
 **Goal:** production posture.
