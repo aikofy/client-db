@@ -177,10 +177,11 @@ Once connected, the library:
 > and writes** from a Consumer against a Normal Client — JWS tokens are verified locally with
 > WebCrypto (ES256/RS256); writes are idempotent (auto-keyed, deduped) and replicate to other
 > Normal Clients via the normal gossip pipeline; **server-streaming** is supported (async-generator
-> handlers, backpressure-aware, cancellable); and a dropped Normal Client triggers **transparent
-> failover** to another candidate with **read-your-writes** preserved. Production hardening
-> (rate limiting, audit, capability/version negotiation) is the remaining work. Requires a
-> **role-aware signaling server** — see
+> handlers, backpressure-aware, cancellable); a dropped Normal Client triggers **transparent
+> failover** to another candidate with **read-your-writes** preserved; and it's hardened with
+> **per-consumer rate limiting**, **payload caps**, an **observability/audit hook**, and
+> **capability/version negotiation**. The remaining work is docs, examples, and release. Requires
+> a **role-aware signaling server** — see
 > [`docs/signaling-protocol.md`](./docs/signaling-protocol.md). Full design:
 > [`docs/consumer-client-plan.md`](./docs/consumer-client-plan.md),
 > [`docs/rpc-protocol.md`](./docs/rpc-protocol.md).
@@ -316,6 +317,34 @@ await consumer.invoke('todos.listMine');                       // auto-replayed 
 await consumer.invoke('todos.create', { title: 'x' });         // not replayed → surfaces error
 await consumer.invoke('todos.create', { title: 'x' }, { idempotent: true }); // opt into replay
 ```
+
+### Hardening & observability
+
+The RPC server applies per-consumer **rate limiting** (token bucket → `RESOURCE_EXHAUSTED`) and
+**payload caps** (`INVALID_ARGUMENT`), advertises its method catalog so the Consumer SDK
+**fails fast** (`NOT_FOUND`, no round-trip) on an unsupported method, and rejects a **newer
+protocol version** at auth. An `onCall` hook fires once per call for **metrics and audit**:
+
+```ts
+const db = await createDB({
+  name, version, collections, sync,
+  rpc: {
+    router,
+    verifyToken,
+    onCall: (rec) => {
+      metrics.timing(`rpc.${rec.method}`, rec.durationMs, { status: rec.status });
+      if (rec.kind === 'write') {
+        // Audit trail keyed by the authenticated identity. Persist to a (replicated) collection
+        // for a durable, gossip-shared log.
+        void db.audit.put({ who: rec.identityId, method: rec.method, status: rec.status });
+      }
+    },
+  },
+});
+```
+
+Limits are configurable via `rpc` (`idempotencyTtlMs`, `readAfterTimeoutMs`) and the server's
+`limits` (`maxPayloadBytes`, `defaultDeadlineMs`, `rateLimit.perMin`).
 
 ---
 

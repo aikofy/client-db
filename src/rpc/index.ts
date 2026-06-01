@@ -19,6 +19,9 @@ export type { TokenVerifierOptions, JwtClaims, SupportedAlg, Jwk } from './auth.
 export { IdempotencyCache } from './idempotency.js';
 export type { IdempotencyCacheOptions } from './idempotency.js';
 
+export { TokenBucket, byteSize } from './middleware.js';
+export type { CallRecord } from './middleware.js';
+
 export type { RpcContext, ConsumerIdentity } from './context.js';
 
 export {

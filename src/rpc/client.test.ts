@@ -5,7 +5,7 @@ import type { AuthOkFrame, ClientFrame, ReqFrame } from './protocol.js';
 
 const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
-function authOk(methods: AuthOkFrame['methods'] = []): AuthOkFrame {
+function authOk(methods: AuthOkFrame['methods'] = [{ name: 'm', kind: 'read', version: 1 }]): AuthOkFrame {
   return {
     type: 'auth-ok',
     server: 'normalA',
@@ -131,6 +131,16 @@ describe('RpcClient', () => {
     expect(rreq.idempotencyKey).toBeUndefined(); // reads aren't keyed
     client.handleMessage({ type: 'res', id: rreq.id, status: 'OK', body: 2 });
     await pr;
+  });
+
+  it('fails fast with NOT_FOUND for a method the server did not advertise', async () => {
+    const { client, sent } = makeClient(() => 'tok');
+    const p = client.invoke('nope'); // not in the advertised catalog (only 'm')
+    await flush();
+    client.handleMessage(authOk()); // catalog = [{ name: 'm', ... }]
+    await expect(p).rejects.toMatchObject({ status: 'NOT_FOUND' });
+    // No req frame was ever sent — the client short-circuited.
+    expect(reqs(sent).length).toBe(0);
   });
 
   it('reset() rejects pending calls', async () => {

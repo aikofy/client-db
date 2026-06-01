@@ -3,6 +3,8 @@ import type { RpcContext, ConsumerIdentity } from './context.js';
 import { RpcError, defaultRetryable } from './errors.js';
 import { RpcRouter, type HandlerDef, type RpcHandler, type StreamHandler } from './router.js';
 import { IdempotencyCache } from './idempotency.js';
+import { TokenBucket, byteSize, type CallRecord } from './middleware.js';
+import type { MethodKind } from './protocol.js';
 import {
   PROTOCOL_VERSION,
   DEFAULT_LIMITS,
@@ -46,6 +48,8 @@ export interface RpcServerConfig {
   /** Max time (ms) to wait for the local replica to catch up to a request's `readAfter`
    *  watermark before replying UNAVAILABLE. Default 2000. */
   readAfterTimeoutMs?: number;
+  /** Observability hook — invoked once per call (success or failure) for metrics/audit. */
+  onCall?: (record: CallRecord) => void;
 }
 
 const DEFAULT_READ_AFTER_TIMEOUT_MS = 2000;
@@ -62,6 +66,7 @@ interface Session {
   /** Token expiry (ms epoch) from claims.exp, if present; reqs after this force re-auth. */
   expiresAt?: number;
   inflight: Map<string, InflightCall>;
+  bucket: TokenBucket;
 }
 
 /**
@@ -99,7 +104,23 @@ export class RpcServer {
   }
 
   onConnect(consumerId: string): void {
-    this.sessions.set(consumerId, { authenticated: false, identity: null, inflight: new Map() });
+    this.sessions.set(consumerId, {
+      authenticated: false,
+      identity: null,
+      inflight: new Map(),
+      bucket: new TokenBucket(this.limits.rateLimit.perMin, Date.now()),
+    });
+  }
+
+  private _record(
+    consumerId: string,
+    identityId: string,
+    method: string,
+    kind: MethodKind | 'unknown',
+    status: RpcStatus,
+    start: number,
+  ): void {
+    this.config.onCall?.({ consumerId, identityId, method, kind, status, durationMs: Date.now() - start });
   }
 
   onDisconnect(consumerId: string): void {
@@ -149,6 +170,16 @@ export class RpcServer {
     session: Session,
     frame: AuthFrame,
   ): Promise<void> {
+    // Capability/version negotiation: refuse a client newer than this server understands.
+    if (typeof frame.protocolVersion === 'number' && frame.protocolVersion > PROTOCOL_VERSION) {
+      this.config.send(consumerId, {
+        type: 'auth-err',
+        status: 'FAILED_PRECONDITION',
+        message: `unsupported protocol version ${frame.protocolVersion} (server: ${PROTOCOL_VERSION})`,
+      });
+      return;
+    }
+
     let identity: ConsumerIdentity | null;
     try {
       identity = this.config.verifyToken
@@ -182,8 +213,16 @@ export class RpcServer {
   }
 
   private _handleReq(consumerId: string, session: Session, frame: ReqFrame): void {
+    const start = Date.now();
+    const idId = session.identity?.id ?? consumerId;
+    // Reject + record an outcome in one place (used for all pre-dispatch failures).
+    const reject = (status: RpcStatus, message: string, kind: MethodKind | 'unknown', retryable?: boolean): void => {
+      this.config.send(consumerId, errFrame(frame.id, status, message, retryable));
+      this._record(consumerId, idId, frame.method, kind, status, start);
+    };
+
     if (!session.authenticated || !session.identity) {
-      this.config.send(consumerId, errFrame(frame.id, 'UNAUTHENTICATED', 'authenticate first'));
+      reject('UNAUTHENTICATED', 'authenticate first', 'unknown');
       return;
     }
     // Token expiry (spec §8): once a session's token has expired, force a fresh auth.
@@ -191,16 +230,26 @@ export class RpcServer {
       session.authenticated = false;
       session.identity = null;
       session.expiresAt = undefined;
-      this.config.send(consumerId, errFrame(frame.id, 'UNAUTHENTICATED', 'token expired; re-authenticate'));
+      reject('UNAUTHENTICATED', 'token expired; re-authenticate', 'unknown');
+      return;
+    }
+    // Per-consumer rate limit.
+    if (!session.bucket.tryRemove(start)) {
+      reject('RESOURCE_EXHAUSTED', 'rate limit exceeded', 'unknown', true);
+      return;
+    }
+    // Payload cap.
+    if (byteSize(frame.params) > this.limits.maxPayloadBytes) {
+      reject('INVALID_ARGUMENT', 'request payload too large', 'unknown');
       return;
     }
     const def = this.config.router.get(frame.method);
     if (!def) {
-      this.config.send(consumerId, errFrame(frame.id, 'NOT_FOUND', `unknown method "${frame.method}"`));
+      reject('NOT_FOUND', `unknown method "${frame.method}"`, 'unknown');
       return;
     }
     if (def.kind === 'stream') {
-      this._handleStream(consumerId, session, def, frame);
+      this._handleStream(consumerId, session, def, frame, start);
       return;
     }
 
@@ -212,7 +261,11 @@ export class RpcServer {
       settled = true;
       clearTimeout(timer);
       session.inflight.delete(frame.id);
-      if (out) this.config.send(consumerId, out);
+      if (out) {
+        this.config.send(consumerId, out);
+        const status: RpcStatus = out.type === 'res' ? 'OK' : out.type === 'err' ? out.status : 'INTERNAL';
+        this._record(consumerId, idId, frame.method, def.kind, status, start);
+      }
     };
     const deadlineMs = frame.deadlineMs ?? this.limits.defaultDeadlineMs;
     timer = setTimeout(() => {
@@ -268,7 +321,14 @@ export class RpcServer {
     }
   }
 
-  private _handleStream(consumerId: string, session: Session, def: HandlerDef, frame: ReqFrame): void {
+  private _handleStream(
+    consumerId: string,
+    session: Session,
+    def: HandlerDef,
+    frame: ReqFrame,
+    start: number,
+  ): void {
+    const idId = session.identity?.id ?? consumerId;
     const ac = new AbortController();
     let settled = false;
     let timer: ReturnType<typeof setTimeout>;
@@ -278,7 +338,11 @@ export class RpcServer {
       clearTimeout(timer);
       ac.abort(); // stops the producer (the async generator) via ctx.signal
       session.inflight.delete(frame.id);
-      if (out) this.config.send(consumerId, out);
+      if (out) {
+        this.config.send(consumerId, out);
+        const status: RpcStatus = out.type === 'res' ? 'OK' : out.type === 'err' ? out.status : 'INTERNAL';
+        this._record(consumerId, idId, frame.method, def.kind, status, start);
+      }
     };
     const deadlineMs = frame.deadlineMs ?? this.limits.defaultDeadlineMs;
     timer = setTimeout(() => finish(errFrame(frame.id, 'DEADLINE_EXCEEDED', 'deadline exceeded', false)), deadlineMs);
@@ -292,6 +356,7 @@ export class RpcServer {
         clearTimeout(timer);
         session.inflight.delete(frame.id);
         this.config.send(consumerId, { type: 'stream-end', id: frame.id, status: 'OK' });
+        this._record(consumerId, idId, frame.method, def.kind, 'OK', start);
       })
       .catch((e) => {
         finish(

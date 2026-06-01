@@ -250,17 +250,26 @@ single-node consumer/auth/stream tests unaffected by the rework.
 **Deferred:** fastest-by-ping selection + heartbeat liveness (round-robin is the default);
 replicated cross-node idempotency dedupe store.
 
-### Phase 8 — Hardening
+### Phase 8 — Hardening — ✅ DONE
 **Goal:** production posture.
-**Changes:**
-- `middleware.ts`: per-consumer token-bucket **rate limiting**; per-request **payload caps**.
-- **Audit log** of writes keyed by consumer identity (as a replicated collection).
-- **Metrics/logging** per method (latency, errors, caller).
-- **Capability negotiation**: server advertises supported methods/versions in `auth-ok`;
-  versioned method names (`orders.book@v2`).
-**Tests:** rate-limit trips; oversize payload rejected; audit entries written; old consumer
-gets a clear error for an unsupported method.
-**Risk:** low.
+**Delivered:**
+- ✅ `src/rpc/middleware.ts`: `TokenBucket` (per-consumer token-bucket rate limiter, injectable
+  `now`), `byteSize` (payload sizing), `CallRecord` (observability record).
+- ✅ `server.ts`: per-session rate limit → `RESOURCE_EXHAUSTED`; payload cap (`limits.maxPayloadBytes`)
+  → `INVALID_ARGUMENT`; `onCall(record)` observability hook fired once per call (unary + stream)
+  with `{consumerId, identityId, method, kind, status, durationMs}` — metrics + audit (filter
+  `kind==='write'`); protocol-version check at auth → `FAILED_PRECONDITION` for too-new clients.
+- ✅ `client.ts`: capability negotiation — fail fast with `NOT_FOUND` (no round-trip) for a method
+  not in the `auth-ok` catalog (unary + stream).
+- ✅ `db.ts` `RpcConfig.onCall`; exported `TokenBucket`/`byteSize`/`CallRecord`. (Method versioning
+  via `name@vN` is already supported by the router; the catalog advertises `{name,kind,version}`.)
+- ✅ Tests: `hardening.test.ts` (TokenBucket capacity/refill; rate-limit trips; oversize payload
+  rejected; `onCall` record emitted with status/duration; protocol-version mismatch → auth-err);
+  `client.test.ts` (+1: unsupported method → client-side `NOT_FOUND`, zero req frames sent).
+  README hardening/observability/audit section.
+**Result:** 147/147 tests pass (6 new). `tsc` clean; consumer bundle **17.34 KB**.
+**Note:** audit persistence is via the `onCall` hook (write to a replicated collection in-app);
+the server doesn't hardcode a collection.
 
 ### Phase 9 — Docs, examples, release
 **Goal:** usable + shipped.

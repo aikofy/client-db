@@ -89,6 +89,7 @@ export class RpcClient {
 
   async invoke<R = unknown>(method: string, params?: unknown, opts?: InvokeOptions): Promise<R> {
     await this.authenticate();
+    this._assertMethodSupported(method);
     // Auto-attach a STABLE idempotency key for write methods so a retry (e.g. after the channel
     // dropped, or a failover in Phase 7) is deduped server-side rather than applied twice. The
     // key is fixed once here, so it survives the re-auth retry below.
@@ -125,6 +126,13 @@ export class RpcClient {
     return this.serverInfo?.methods.some((m) => m.name === method && m.kind === 'write') ?? false;
   }
 
+  /** Capability negotiation: fail fast (no round-trip) if the server didn't advertise `method`. */
+  private _assertMethodSupported(method: string): void {
+    if (this.serverInfo && !this.serverInfo.methods.some((m) => m.name === method)) {
+      throw new RpcError('NOT_FOUND', `server does not support method "${method}"`);
+    }
+  }
+
   /** Call a server-streaming method. Yields chunks in order; throws on error; cancels on
    *  early break or `opts.signal`. */
   stream<T = unknown>(method: string, params?: unknown, opts?: InvokeOptions): AsyncGenerator<T> {
@@ -133,6 +141,7 @@ export class RpcClient {
 
   private async *_stream<T>(method: string, params?: unknown, opts?: InvokeOptions): AsyncGenerator<T> {
     await this.authenticate();
+    this._assertMethodSupported(method);
     const id = (this.cfg.generateId ?? genId)();
     const deadlineMs = opts?.deadlineMs ?? this.cfg.defaultDeadlineMs ?? DEFAULT_DEADLINE_MS;
     const call = new StreamCall<T>();
