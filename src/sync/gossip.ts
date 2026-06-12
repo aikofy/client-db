@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
+import { isValidHLC, parseHLC } from '../core/hlc.js';
 import { resolveConflict, logConflict } from '../core/conflict.js';
 import {
   requestSnapshot,
@@ -27,6 +28,10 @@ const GOSSIP_INTERVAL_MS = 30_000;
 const FANOUT = 3;
 const META_PEER_SYNC_PREFIX = 'lastSync:';
 const SYNC_PAGE_SIZE = 500;
+/** Default bound on how far ahead of the local clock a remote HLC may be (24 h). */
+export const DEFAULT_MAX_CLOCK_DRIFT_MS = 24 * 60 * 60 * 1000;
+/** Defensive cap on `_id` length for docs accepted from the network. */
+const MAX_REMOTE_ID_LENGTH = 1024;
 // Wait this long after first peer-hello before picking the "best" peer for bootstrap,
 // so we have time to collect hellos from all initially-connected peers.
 const BOOTSTRAP_DELAY_MS = 300;
@@ -52,16 +57,28 @@ export class GossipSync {
   // Fix A: broadcasts that arrived while snapshot was being imported
   private pendingBroadcasts: Doc[][] = [];
 
+  private readonly maxClockDriftMs: number;
+
   constructor(
     transport: WebRTCTransport,
     adapter: IndexedDBAdapter,
     collections: Record<string, CollectionSchema>,
     ttlDays = 30,
+    maxClockDriftMs = DEFAULT_MAX_CLOCK_DRIFT_MS,
   ) {
     this.transport = transport;
     this.adapter = adapter;
     this.collections = collections;
     this.ttlMs = ttlDays > 0 ? ttlDays * 24 * 60 * 60 * 1000 : 0;
+    this.maxClockDriftMs = maxClockDriftMs;
+  }
+
+  /** True iff `ts` is a well-formed HLC whose physical time is not unacceptably far
+   *  in the future. Every network-received timestamp must pass before touching the
+   *  local clock — see SyncConfig.maxClockDriftMs for the threat model. */
+  private _acceptableHlc(ts: unknown): ts is HLCTimestamp {
+    if (!isValidHLC(ts)) return false;
+    return parseHLC(ts).physicalMs <= Date.now() + this.maxClockDriftMs;
   }
 
   start(): void {
@@ -93,11 +110,13 @@ export class GossipSync {
     setTimeout(() => void this._gossipRound(), 1000);
 
     if (this.ttlMs > 0) {
-      void this.adapter.pruneChanges(this.ttlMs);
-      this.pruneIntervalId = setInterval(
-        () => void this.adapter.pruneChanges(this.ttlMs),
-        24 * 60 * 60 * 1000,
-      );
+      const prune = (): void => {
+        void this.adapter.pruneChanges(this.ttlMs);
+        // The conflict audit log shares the TTL — without pruning it grows forever.
+        void this.adapter.pruneConflicts(this.ttlMs);
+      };
+      prune();
+      this.pruneIntervalId = setInterval(prune, 24 * 60 * 60 * 1000);
     }
   }
 
@@ -118,20 +137,30 @@ export class GossipSync {
 
   /** Push a single doc to all connected peers immediately (no round-trip). */
   broadcastDoc(collection: string, doc: Doc): void {
+    this.broadcastDocs(collection, [doc]);
+  }
+
+  /**
+   * Push a batch of docs (one collection) to all connected peers as ONE message.
+   * Applying a 500-doc sync page used to re-broadcast 500 individual messages
+   * per peer; batching keeps the flooding semantics at 1/500th the frames.
+   */
+  broadcastDocs(collection: string, docs: Doc[]): void {
+    if (docs.length === 0) return;
     const peers = this.transport.peers();
     if (peers.length === 0) return;
 
     const message: SyncResponseMessage = {
       type: 'sync-response',
-      changes: [{
+      changes: docs.map((doc) => ({
         id: doc._id,
         collection,
         _rev: doc._rev,
         _updatedAt: doc._updatedAt,
-        operation: doc._deleted ? 'delete' : 'put',
+        operation: doc._deleted ? ('delete' as const) : ('put' as const),
         origin: 'local' as const,
-      }],
-      docs: [{ ...doc, _collection: collection } as Doc & { _collection: string }],
+      })),
+      docs: docs.map((doc) => ({ ...doc, _collection: collection }) as Doc & { _collection: string }),
       fromNodeId: this.adapter.nodeId,
       requestId: uuidv4(),
     };
@@ -151,6 +180,9 @@ export class GossipSync {
   }
 
   private async _handlePeerHello(peerId: string, msg: PeerHelloMessage): Promise<void> {
+    // A malformed or far-future HLC must not enter best-peer selection (it would
+    // make a poisoned peer the bootstrap source) nor the post-bootstrap pull check.
+    if (!this._acceptableHlc(msg.currentHLC)) return;
     this.peerHLCs.set(peerId, msg.currentHLC);
 
     if (this.bootstrapped) {
@@ -198,7 +230,7 @@ export class GossipSync {
         }
 
         try {
-          await requestSnapshot(this.transport, bestPeer, this.adapter);
+          await requestSnapshot(this.transport, bestPeer, this.adapter, this.maxClockDriftMs);
         } catch {
           // snapshot failed — fall back to full delta from that peer
           await this._syncWithPeer(bestPeer).catch(() => undefined);
@@ -322,7 +354,7 @@ export class GossipSync {
           // from a snapshot. Only advance the watermark if the snapshot actually
           // succeeds; otherwise the un-streamed changes would be skipped forever.
           try {
-            await requestSnapshot(this.transport, peerId, this.adapter);
+            await requestSnapshot(this.transport, peerId, this.adapter, this.maxClockDriftMs);
             await this._setLastSyncHLC(peerId, this.adapter.getHLC().now());
           } catch {
             // leave watermark; next round re-detects needsFullSync and retries
@@ -451,11 +483,17 @@ export class GossipSync {
     const hlc = this.adapter.getHLC();
     const before = hlc.now();
 
-    // Advance the HLC for every remote doc (in order) and group docs by
-    // collection. Behaviour matches the previous per-doc loop: HLC is advanced
-    // for every remote (including skipped ones), unknown collections are ignored.
+    // Validate, advance the HLC for every accepted remote doc (in order), and
+    // group docs by collection. Validation comes FIRST: a malformed `_rev` /
+    // `_updatedAt` would corrupt the clock (NaN), and a far-future timestamp
+    // would permanently poison LWW for the whole replica — reject both, along
+    // with docs missing a usable string `_id`. Unknown collections still advance
+    // the HLC (they are well-formed data we simply don't store).
     const byCollection = new Map<string, Doc[]>();
     for (const remote of docs) {
+      if (remote === null || typeof remote !== 'object') continue;
+      if (typeof remote._id !== 'string' || remote._id.length === 0 || remote._id.length > MAX_REMOTE_ID_LENGTH) continue;
+      if (!this._acceptableHlc(remote._updatedAt) || !this._acceptableHlc(remote._rev)) continue;
       hlc.update(remote._updatedAt);
       const collection = remote['_collection'] as string | undefined;
       if (!collection || !this.collections[collection]) continue;

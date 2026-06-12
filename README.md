@@ -323,10 +323,14 @@ await consumer.invoke('todos.create', { title: 'x' }, { idempotent: true }); // 
 
 ### Hardening & observability
 
-The RPC server applies per-consumer **rate limiting** (token bucket → `RESOURCE_EXHAUSTED`) and
-**payload caps** (`INVALID_ARGUMENT`), advertises its method catalog so the Consumer SDK
-**fails fast** (`NOT_FOUND`, no round-trip) on an unsupported method, and rejects a **newer
-protocol version** at auth. An `onCall` hook fires once per call for **metrics and audit**:
+The RPC server applies per-consumer **rate limiting** (token bucket → `RESOURCE_EXHAUSTED`),
+**payload caps** (`INVALID_ARGUMENT`), and a **concurrency cap** (`maxInflight`, default 64 —
+stops one consumer from holding hundreds of long-lived calls/streams open). Auth is bounded too:
+tokens over 8 KB are refused before any crypto work, and **5 failed auth attempts** lock the
+connection out (`RESOURCE_EXHAUSTED`; reconnect to retry) so a single channel can't brute-force
+tokens or burn CPU on signature verifies. The server advertises its method catalog so the
+Consumer SDK **fails fast** (`NOT_FOUND`, no round-trip) on an unsupported method, and rejects a
+**newer protocol version** at auth. An `onCall` hook fires once per call for **metrics and audit**:
 
 ```ts
 const db = await createDB({
@@ -347,7 +351,7 @@ const db = await createDB({
 ```
 
 Limits are configurable on the `rpc` option: `idempotencyTtlMs`, `readAfterTimeoutMs`, and
-`limits` (`maxPayloadBytes`, `defaultDeadlineMs`, `rateLimit.perMin`).
+`limits` (`maxPayloadBytes`, `defaultDeadlineMs`, `rateLimit.perMin`, `maxInflight`).
 
 ---
 
@@ -457,6 +461,9 @@ Returns a `TypedDB<C>` — an object where each key of `collections` is a `Colle
 | `iceServers` | `IceServer[]` | STUN/TURN servers for WebRTC |
 | `nodeId` | `string` (optional) | Override auto-generated node UUID |
 | `initialSnapshot` | `Snapshot \| Promise<Snapshot \| null \| undefined>` (optional) | Seed the DB before connecting to peers. Peer connections are held until this settles. See [Cloud snapshot seeding](#cloud-snapshot-seeding). |
+| `changeLogTtlDays` | `number` (optional) | Days to keep change-log entries (and `_conflicts` audit records). Pruned on startup and every 24 h. Default `30`; `0` disables pruning. |
+| `maxClockDriftMs` | `number` (optional) | Reject remote docs whose HLC is further than this ahead of the local clock — bounds **clock poisoning** by a peer with a far-future clock. Default 24 h; `Number.POSITIVE_INFINITY` disables. |
+| `serveConsumers` | `boolean` (optional) | Whether this Normal Client accepts Consumer (`rpc`) connections. Default `true`. |
 
 ---
 
@@ -513,6 +520,41 @@ unsubscribe(); // stop listening
 
 ---
 
+### `db.transaction(fn)` — atomic write batch
+
+Group writes across collections into ONE IndexedDB transaction, so they commit
+all-or-nothing (docs, change-log entries, and the HLC watermark together):
+
+```typescript
+const written = await db.transaction((tx) => {
+  tx.orders.put({ _id: orderId, status: 'placed' });
+  tx.orderItems.put({ orderId, sku: 'a', qty: 2 });
+  tx.carts.delete(cartId);
+});
+// written: the committed Docs in op order (tombstones included)
+```
+
+Semantics:
+
+- **All-or-nothing locally.** If any write fails, the transaction aborts — nothing is
+  persisted, no `onChange` fires, nothing is broadcast.
+- **Staging only.** The callback runs synchronously and stages writes; it cannot read.
+  Read what you need *before* the transaction, write inside. (This sidesteps the
+  IndexedDB auto-commit footgun where `await`-ing anything non-IndexedDB kills the tx.)
+- **Per-doc revisions.** Each op gets its own `_rev`, so per-doc LWW conflict resolution
+  is unchanged. Ops apply in order — a `delete` sees a `put` staged before it; deleting a
+  missing id is a no-op.
+- **Efficient fan-out.** Listeners get one `onChange` callback per collection, and peers
+  receive one gossip frame per collection, which they bulk-apply in a single transaction
+  per collection.
+- **Atomicity is local, not global.** Peers *receive* the batch together, but conflict
+  resolution stays per-doc: a concurrent remote edit can win LWW against one doc of your
+  batch and lose against another. Don't rely on cross-document invariants holding under
+  concurrent multi-peer writes; design docs so each is independently mergeable (or use a
+  custom `conflictStrategy`).
+
+---
+
 ### System Fields
 
 Every stored document has these read-only system fields:
@@ -564,7 +606,10 @@ conflictStrategy: (local, remote) => {
 }
 ```
 
-All conflicts (both versions + resolved) are logged to an internal `_conflicts` collection for audit.
+All conflicts (both versions + resolved) are logged to an internal `_conflicts` collection for
+audit. Conflict records are **local-only diagnostics**: they never enter the change log (so they
+are not gossiped to peers) and are pruned on the same TTL as the change log
+(`sync.changeLogTtlDays`, default 30 days), so the audit trail can't grow without bound.
 
 ---
 
@@ -611,7 +656,7 @@ for await (const todo of db.todos.scan({ where: { status: 'open' }, batchSize: 1
 |--------|---------|-------|
 | `db.exportStream(batchSize?)` | `AsyncGenerator<SnapshotChunk>` | header + keyset-paged batches; tombstones included |
 | `db.importStream(chunks)` | `Promise<void>` | consumes chunks; HLC watermark applied **after** all data lands |
-| `db.<collection>.scan(opts?)` | `AsyncGenerator<Doc>` | `where` + `includeDeleted`; `_id` order; no `orderBy` (use `query()` for sorted) |
+| `db.<collection>.scan(opts?)` | `AsyncGenerator<Doc>` | `where` + `includeDeleted`; `_id` order; no `orderBy` (use `query()` for sorted). When a `where` field is backed by a single-field index, scan pages **over the index** — O(matches) instead of O(collection) |
 | `snapshotChunksToNdjsonStream(chunks)` | `ReadableStream<Uint8Array>` | encode chunks as NDJSON, backpressure-aware |
 | `ndjsonStreamToSnapshotChunks(stream)` | `AsyncGenerator<SnapshotChunk>` | decode NDJSON bytes back to chunks |
 

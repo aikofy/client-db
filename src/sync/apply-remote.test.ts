@@ -121,3 +121,88 @@ describe('_applyRemoteChanges (batched)', () => {
     expect(await adapter.get('todos', 'x')).toBeNull();
   });
 });
+
+describe('_applyRemoteChanges — hardening against malicious/buggy peers', () => {
+  let adapter: IndexedDBAdapter;
+  let gossip: GossipSync;
+
+  beforeEach(async () => {
+    globalThis.indexedDB = new IDBFactory();
+    adapter = new IndexedDBAdapter(`arh-${Math.random()}`, 1, collections);
+    await adapter.open();
+    gossip = makeGossip(adapter);
+  });
+
+  it('skips docs with malformed HLC timestamps without corrupting the clock', async () => {
+    const before = adapter.getHLC().now();
+    await apply(gossip, [
+      { _id: 'bad1', _rev: 'garbage', _updatedAt: 'garbage', _deleted: false, _collection: 'todos' } as unknown as Doc,
+      { _id: 'bad2', _rev: undefined, _updatedAt: undefined, _deleted: false, _collection: 'todos' } as unknown as Doc,
+      remote('todos', 'good', 10, { status: 'open' }),
+    ]);
+    expect(await adapter.get('todos', 'bad1')).toBeNull();
+    expect(await adapter.get('todos', 'bad2')).toBeNull();
+    expect((await adapter.get('todos', 'good'))?._rev).toBe(rev(10));
+    // Clock advanced normally (no NaN poisoning)
+    const after = adapter.getHLC().now();
+    expect(after >= before).toBe(true);
+    expect(after.includes('NaN')).toBe(false);
+  });
+
+  it('skips docs without a usable string _id', async () => {
+    await apply(gossip, [
+      { _rev: rev(10), _updatedAt: rev(10), _deleted: false, _collection: 'todos' } as unknown as Doc,
+      { _id: 42, _rev: rev(11), _updatedAt: rev(11), _deleted: false, _collection: 'todos' } as unknown as Doc,
+      null as unknown as Doc,
+    ]);
+    expect((await adapter.changes('' as HLCTimestamp)).length).toBe(0);
+  });
+
+  it('rejects far-future timestamps (clock poisoning) and leaves the local HLC intact', async () => {
+    const farFuture = (String(Date.now() + 365 * 24 * 60 * 60 * 1000).padStart(16, '0') +
+      '-000000-evil') as HLCTimestamp;
+    await apply(gossip, [
+      { _id: 'p1', _rev: farFuture, _updatedAt: farFuture, _deleted: false, _collection: 'todos' } as Doc,
+    ]);
+    expect(await adapter.get('todos', 'p1')).toBeNull();
+    // Local clock NOT dragged a year forward — a subsequent local write still
+    // carries a near-now timestamp, so it can win LWW against honest peers.
+    const localRev = (await adapter.put('todos', { _id: 'mine', status: 'open' }))._rev;
+    expect(localRev < farFuture).toBe(true);
+  });
+
+  it('accepts realistic skew within maxClockDriftMs (default 24 h)', async () => {
+    const skewMs = Date.now() + 60 * 60 * 1000; // 1 h ahead — plausible device skew
+    const skewed = (String(skewMs).padStart(16, '0') + '-000000-skewed') as HLCTimestamp;
+    await apply(gossip, [
+      { _id: 's1', _rev: skewed, _updatedAt: skewed, _deleted: false, _collection: 'todos' } as Doc,
+    ]);
+    expect((await adapter.get('todos', 's1'))?._rev).toBe(skewed);
+  });
+});
+
+describe('broadcastDocs (batched re-broadcast)', () => {
+  it('sends one sync-response frame for a whole batch', async () => {
+    globalThis.indexedDB = new IDBFactory();
+    const adapter = new IndexedDBAdapter(`bb-${Math.random()}`, 1, collections);
+    await adapter.open();
+
+    const broadcasts: Array<{ changes: unknown[]; docs: Doc[] }> = [];
+    const stubTransport = {
+      peers: () => ['p1', 'p2'],
+      broadcast: (m: { changes: unknown[]; docs: Doc[] }) => broadcasts.push(m),
+    };
+    const gossip = new GossipSync(stubTransport as never, adapter, collections, 0);
+
+    // Wire like db.ts does: one broadcast per committed batch.
+    adapter.onChangeBatch((collection, _entries, docs) => gossip.broadcastDocs(collection, docs));
+
+    const docs = Array.from({ length: 5 }, (_, i) => remote('todos', `d${i}`, 100 + i));
+    await adapter.bulkInsert('todos', docs);
+
+    expect(broadcasts.length).toBe(1); // not 5
+    expect(broadcasts[0].docs.length).toBe(5);
+    expect(broadcasts[0].changes.length).toBe(5);
+    expect((broadcasts[0].docs[0] as Doc & { _collection: string })._collection).toBe('todos');
+  });
+});

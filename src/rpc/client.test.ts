@@ -12,7 +12,7 @@ function authOk(methods: AuthOkFrame['methods'] = [{ name: 'm', kind: 'read', ve
     protocolVersion: 1,
     methods,
     serverHlc: 'h' as never,
-    limits: { maxPayloadBytes: 1024, defaultDeadlineMs: 1000, rateLimit: { perMin: 100 } },
+    limits: { maxPayloadBytes: 1024, defaultDeadlineMs: 1000, rateLimit: { perMin: 100 }, maxInflight: 64 },
   };
 }
 

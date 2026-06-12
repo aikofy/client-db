@@ -20,6 +20,11 @@ const BULK_INSERT_BATCH_SIZE = 1000;
 const CONFLICTS_STORE = '_conflicts';
 const SYSTEM_STORES = [CHANGES_STORE, META_STORE, CONFLICTS_STORE];
 
+/** One staged operation of an atomic write batch (see `applyBatch` / `db.transaction`). */
+export type BatchOp =
+  | { type: 'put'; collection: string; doc: Record<string, unknown> }
+  | { type: 'delete'; collection: string; id: string };
+
 export class IndexedDBAdapter implements IStorageAdapter {
   private db!: IDBPDatabase;
   private hlc!: HLC;
@@ -27,6 +32,9 @@ export class IndexedDBAdapter implements IStorageAdapter {
   readonly version: number;
   private readonly collections: Record<string, CollectionSchema>;
   private changeListeners: Array<(entry: ChangeEntry, doc: Doc) => void> = [];
+  private changeBatchListeners: Array<
+    (collection: string, entries: ChangeEntry[], docs: Doc[]) => void
+  > = [];
   /** collection → set of single-field index keyPaths usable for equality lookups. */
   private readonly singleFieldIndexes = new Map<string, Set<string>>();
 
@@ -142,13 +150,39 @@ export class IndexedDBAdapter implements IStorageAdapter {
     };
   }
 
-  private _emitChange(entry: ChangeEntry, doc: Doc): void {
+  /**
+   * Batched change notification: one callback per committed write transaction
+   * (a single put/delete, or one bulkInsert chunk — always one collection).
+   * Prefer this over `onChangeEntry` for fan-out work (UI listeners, gossip
+   * re-broadcast): a 1000-doc sync batch costs 1 callback instead of 1000.
+   */
+  onChangeBatch(cb: (collection: string, entries: ChangeEntry[], docs: Doc[]) => void): () => void {
+    this.changeBatchListeners.push(cb);
+    return () => {
+      this.changeBatchListeners = this.changeBatchListeners.filter((l) => l !== cb);
+    };
+  }
+
+  private _emitChanges(collection: string, entries: ChangeEntry[], docs: Doc[]): void {
     // Runs AFTER the write transaction has committed. A throwing listener must
     // not reject the (already durable) put/delete/bulkInsert, nor starve later
     // listeners — surface it out of band instead.
-    for (const cb of this.changeListeners) {
+    if (this.changeListeners.length > 0) {
+      for (let i = 0; i < entries.length; i++) {
+        for (const cb of this.changeListeners) {
+          try {
+            cb(entries[i], docs[i]);
+          } catch (err) {
+            queueMicrotask(() => {
+              throw err;
+            });
+          }
+        }
+      }
+    }
+    for (const cb of this.changeBatchListeners) {
       try {
-        cb(entry, doc);
+        cb(collection, entries, docs);
       } catch (err) {
         queueMicrotask(() => {
           throw err;
@@ -185,7 +219,7 @@ export class IndexedDBAdapter implements IStorageAdapter {
     await tx.objectStore(META_STORE).put({ key: 'hlc', value: rev });
     await tx.done;
 
-    this._emitChange(changeEntry, record);
+    this._emitChanges(collection, [changeEntry], [record]);
     return record;
   }
 
@@ -252,6 +286,45 @@ export class IndexedDBAdapter implements IStorageAdapter {
     const records = (await tx.objectStore(collection).getAll(range, size)) as Doc[];
     await tx.done;
     return records;
+  }
+
+  /**
+   * Internal (scan only): forward keyset page over a single-field equality index.
+   * Returns up to `limit` docs whose `field === value` and `_id > afterId`, in
+   * ascending `_id` order — the same subset/order `_querySnapshotBatch` + an
+   * in-memory equality filter would produce, but touching O(matches) records
+   * instead of O(store).
+   */
+  private async _queryIndexBatch(
+    collection: string,
+    field: string,
+    value: IDBValidKey,
+    afterId: string | null,
+    limit: number,
+  ): Promise<Doc[]> {
+    const size = Math.max(1, Math.trunc(limit));
+    const tx = this.db.transaction(collection, 'readonly');
+    const index = tx.objectStore(collection).index(field);
+    // For one index key, cursor order is ascending primary key (_id).
+    let cursor = await index.openCursor(IDBKeyRange.only(value));
+    if (cursor && afterId !== null) {
+      const pk = cursor.primaryKey as string;
+      if (pk === afterId) {
+        cursor = await cursor.continue();
+      } else if (pk < afterId) {
+        // Jump straight to afterId (continuePrimaryKey is inclusive, so step past it).
+        cursor = await cursor.continuePrimaryKey(value, afterId);
+        if (cursor && (cursor.primaryKey as string) === afterId) cursor = await cursor.continue();
+      }
+      // pk > afterId: already past the watermark — keep the cursor as is.
+    }
+    const out: Doc[] = [];
+    while (cursor && out.length < size) {
+      out.push(cursor.value as Doc);
+      cursor = await cursor.continue();
+    }
+    await tx.done;
+    return out;
   }
 
   /** Pre-compute the [key, value] pairs of a where clause once, dropping the
@@ -421,40 +494,117 @@ export class IndexedDBAdapter implements IStorageAdapter {
     await tx.objectStore(META_STORE).put({ key: 'hlc', value: rev });
     await tx.done;
 
-    this._emitChange(changeEntry, tombstone);
+    this._emitChanges(collection, [changeEntry], [tombstone]);
+  }
+
+  /**
+   * Atomic write batch: apply `ops` (puts/deletes across any user collections), in
+   * order, inside ONE IndexedDB transaction together with their change-log entries
+   * and the HLC watermark. All-or-nothing — if any op fails the transaction is
+   * aborted and nothing is persisted or emitted. Each op gets its own `_rev`
+   * (per-doc LWW stays intact); a delete of a missing id is a no-op; ops on the
+   * same id apply in submitted order (a delete sees a put staged before it).
+   * Returns the committed docs (tombstones included, no-op deletes omitted).
+   *
+   * Atomicity is LOCAL: peers receive the batch as one frame per collection and
+   * bulk-apply it, but cross-peer conflict resolution remains per-doc.
+   */
+  async applyBatch(ops: BatchOp[]): Promise<Doc[]> {
+    if (ops.length === 0) return [];
+    const collections = Array.from(new Set(ops.map((o) => o.collection)));
+    const tx = this.db.transaction([...collections, CHANGES_STORE, META_STORE], 'readwrite');
+    const written: Doc[] = [];
+    const entries: ChangeEntry[] = [];
+    try {
+      const changesStore = tx.objectStore(CHANGES_STORE);
+      let lastRev: HLCTimestamp | null = null;
+      for (const op of ops) {
+        const store = tx.objectStore(op.collection);
+        let record: Doc;
+        let operation: ChangeEntry['operation'];
+        if (op.type === 'put') {
+          const rev = this.hlc.tick();
+          record = {
+            ...op.doc,
+            _id: (op.doc['_id'] as string) ?? uuidv4(),
+            _rev: rev,
+            _deleted: false,
+            _updatedAt: rev,
+          };
+          operation = 'put';
+        } else {
+          // Read inside the same tx so a put staged earlier in this batch is seen.
+          // Missing id → no-op, matching delete().
+          const existing = (await store.get(op.id)) as Doc | undefined;
+          if (!existing) continue;
+          const rev = this.hlc.tick();
+          record = { ...existing, _deleted: true, _rev: rev, _updatedAt: rev };
+          operation = 'delete';
+        }
+        const entry: ChangeEntry = {
+          id: record._id,
+          collection: op.collection,
+          _rev: record._rev,
+          _updatedAt: record._updatedAt,
+          operation,
+          origin: 'local',
+        };
+        await store.put(record);
+        await changesStore.put(entry);
+        written.push(record);
+        entries.push(entry);
+        lastRev = record._rev;
+      }
+      if (lastRev === null) return []; // every op was a no-op; tx auto-closes
+      await tx.objectStore(META_STORE).put({ key: 'hlc', value: lastRev });
+    } catch (err) {
+      // Without an explicit abort, the tx would auto-COMMIT the ops already
+      // queued once the request queue drains — the opposite of atomicity.
+      // The abort makes tx.done reject; that rejection is expected — swallow it
+      // so it can't surface as an unhandled rejection (we rethrow the cause).
+      tx.done.catch(() => undefined);
+      try {
+        tx.abort();
+      } catch {
+        // already aborted (e.g. the failing request aborted it)
+      }
+      throw err;
+    }
+    await tx.done;
+
+    // Emit AFTER commit, one batch per collection (op order preserved within each),
+    // matching bulkInsert: listeners get one callback, gossip one frame per collection.
+    const grouped = new Map<string, { entries: ChangeEntry[]; docs: Doc[] }>();
+    for (let i = 0; i < entries.length; i++) {
+      let g = grouped.get(entries[i].collection);
+      if (!g) grouped.set(entries[i].collection, (g = { entries: [], docs: [] }));
+      g.entries.push(entries[i]);
+      g.docs.push(written[i]);
+    }
+    for (const [collection, g] of grouped) this._emitChanges(collection, g.entries, g.docs);
+    return written;
   }
 
   async bulkInsert(collection: string, docs: Doc[]): Promise<void> {
     if (docs.length === 0) return;
     for (let start = 0; start < docs.length; start += BULK_INSERT_BATCH_SIZE) {
       const batch = docs.slice(start, start + BULK_INSERT_BATCH_SIZE);
+      const entries: ChangeEntry[] = batch.map((d) => ({
+        id: d._id,
+        collection,
+        _rev: d._rev,
+        _updatedAt: d._updatedAt,
+        operation: d._deleted ? 'delete' : 'put',
+        origin: 'peer',
+      }));
       const tx = this.db.transaction([collection, CHANGES_STORE], 'readwrite');
       const store = tx.objectStore(collection);
       const changesStore = tx.objectStore(CHANGES_STORE);
       await Promise.all(
-        batch.map((d) => {
-          const entry: ChangeEntry = {
-            id: d._id,
-            collection,
-            _rev: d._rev,
-            _updatedAt: d._updatedAt,
-            operation: d._deleted ? 'delete' : 'put',
-            origin: 'peer',
-          };
-          return Promise.all([store.put(d), changesStore.put(entry)]);
-        }),
+        batch.map((d, i) => Promise.all([store.put(d), changesStore.put(entries[i])])),
       );
       await tx.done;
-      for (const doc of batch) {
-        this._emitChange({
-          id: doc._id,
-          collection,
-          _rev: doc._rev,
-          _updatedAt: doc._updatedAt,
-          operation: doc._deleted ? 'delete' : 'put',
-          origin: 'peer',
-        }, doc);
-      }
+      this._emitChanges(collection, entries, batch);
     }
   }
 
@@ -584,9 +734,18 @@ export class IndexedDBAdapter implements IStorageAdapter {
     // (_updatedAt > x); apply the same predicate here so scan() and query()
     // agree. HLC strings are lexicographically ordered.
     const updatedAtLower = this._updatedAtLowerBound(where);
+    // Equality-index fast path: page over the index's single key value instead of
+    // the whole store. Per-key index order is ascending _id, so the yielded docs
+    // and their order are identical to the full-store path filtered in memory.
+    const indexedField = this._pickIndexedWhereField(collection, where);
+    const indexedValue = indexedField
+      ? ((where as Record<string, unknown>)[indexedField] as IDBValidKey)
+      : null;
     let afterId: string | null = null;
     while (true) {
-      const batch = await this._querySnapshotBatch(collection, afterId, size);
+      const batch: Doc[] = indexedField
+        ? await this._queryIndexBatch(collection, indexedField, indexedValue!, afterId, size)
+        : await this._querySnapshotBatch(collection, afterId, size);
       if (batch.length === 0) break;
       afterId = batch[batch.length - 1]._id;
       for (const doc of batch) {
@@ -649,6 +808,39 @@ export class IndexedDBAdapter implements IStorageAdapter {
     await tx2.done;
     const oldest = first ? (first.value as ChangeEntry)._updatedAt : null;
     await this.setMetaValue('oldestChangesHlc', oldest);
+  }
+
+  /**
+   * Write a conflict-audit record directly to `_conflicts`. Unlike `put()`, this
+   * does NOT tick the HLC, append a change-log entry, or notify change listeners —
+   * conflict records are local diagnostics and must not enter the change log
+   * (where gossip would push them to every peer) nor trigger re-broadcast.
+   */
+  async putConflict(record: Record<string, unknown> & { _id: string }): Promise<void> {
+    // Wall-clock stamp (not hlc.now(), which is 0 on a fresh replica until the
+    // first local write) — pruneConflicts compares against a wall-clock cutoff.
+    const now = formatHLC({ physicalMs: Date.now(), counter: 0, nodeId: this.hlc.nodeId });
+    const tx = this.db.transaction(CONFLICTS_STORE, 'readwrite');
+    await tx.store.put({ ...record, _rev: now, _updatedAt: now, _deleted: false });
+    await tx.done;
+  }
+
+  /** Delete `_conflicts` records older than `olderThanMs` (same cutoff math as
+   *  `pruneChanges`) so the audit log can't grow without bound. */
+  async pruneConflicts(olderThanMs: number): Promise<void> {
+    const cutoffMs = Date.now() - olderThanMs;
+    const cutoffHlc = formatHLC({ physicalMs: cutoffMs, counter: 0, nodeId: '' });
+
+    const tx = this.db.transaction(CONFLICTS_STORE, 'readwrite');
+    const index = tx.objectStore(CONFLICTS_STORE).index('_updatedAt');
+    let cursor = await index.openCursor(IDBKeyRange.upperBound(cutoffHlc, false));
+    const deletes: Promise<void>[] = [];
+    while (cursor) {
+      deletes.push(cursor.delete());
+      cursor = await cursor.continue();
+    }
+    await Promise.all(deletes);
+    await tx.done;
   }
 
   async getOldestChangesHlc(): Promise<HLCTimestamp | null> {

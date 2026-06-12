@@ -1,10 +1,18 @@
 export { createDB } from './db.js';
-export type { TypedDB, DBBase, CollectionProxy, SyncStatus, RpcConfig } from './db.js';
+export type {
+  TypedDB,
+  DBBase,
+  CollectionProxy,
+  TxCollectionProxy,
+  TransactionProxy,
+  SyncStatus,
+  RpcConfig,
+} from './db.js';
 
 // RPC server: define read/write/stream handlers a Normal Client exposes to Consumers.
 export * from './rpc/index.js';
 
-export { HLC, parseHLC, formatHLC } from './core/hlc.js';
+export { HLC, parseHLC, formatHLC, isValidHLC } from './core/hlc.js';
 export type { HLCState } from './core/hlc.js';
 
 export type {
@@ -46,9 +54,10 @@ export {
 
 export { resolveConflict, logConflict } from './core/conflict.js';
 export { IndexedDBAdapter } from './storage/indexeddb.js';
+export type { BatchOp } from './storage/indexeddb.js';
 export { WebRTCTransport } from './sync/webrtc-transport.js';
 export type { WebRTCTransportConfig } from './sync/webrtc-transport.js';
-export { GossipSync } from './sync/gossip.js';
+export { GossipSync, DEFAULT_MAX_CLOCK_DRIFT_MS } from './sync/gossip.js';
 export {
   exportSnapshot,
   importSnapshot,

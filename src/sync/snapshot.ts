@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
+import { isValidHLC, parseHLC } from '../core/hlc.js';
 import type {
   IStorageAdapter,
   Snapshot,
@@ -83,6 +84,8 @@ interface StreamReceiveState {
   resolve: () => void;
   reject: (e: Error) => void;
   timeoutId: ReturnType<typeof setTimeout>;
+  /** Bound on future clock drift for the stream-end HLC (see SyncConfig.maxClockDriftMs). */
+  maxClockDriftMs: number;
 }
 
 const _activeStreams = new Map<string, StreamReceiveState>();
@@ -91,6 +94,7 @@ export function requestSnapshot(
   transport: WebRTCTransport,
   peerId: string,
   adapter: IStorageAdapter,
+  maxClockDriftMs: number = Number.POSITIVE_INFINITY,
 ): Promise<void> {
   const requestId = uuidv4();
 
@@ -100,7 +104,7 @@ export function requestSnapshot(
       reject(new Error('Snapshot stream timed out'));
     }, 120_000);
 
-    _activeStreams.set(requestId, { adapter, resolve, reject, timeoutId });
+    _activeStreams.set(requestId, { adapter, resolve, reject, timeoutId, maxClockDriftMs });
 
     const req: SnapshotRequestMessage = {
       type: 'snapshot-request',
@@ -148,9 +152,17 @@ export async function handleSnapshotStreamEnd(
   _activeStreams.delete(msg.requestId);
 
   try {
-    const concreteAdapter = state.adapter as IndexedDBAdapter;
-    concreteAdapter.getHLC().update(msg.hlc);
-    await concreteAdapter.persistHLC();
+    // A malformed or far-future watermark must not poison the local clock (the
+    // imported docs carry their own revs and never touch it). Still resolve —
+    // the snapshot data landed.
+    const ok =
+      isValidHLC(msg.hlc) &&
+      parseHLC(msg.hlc).physicalMs <= Date.now() + state.maxClockDriftMs;
+    if (ok) {
+      const concreteAdapter = state.adapter as IndexedDBAdapter;
+      concreteAdapter.getHLC().update(msg.hlc);
+      await concreteAdapter.persistHLC();
+    }
     state.resolve();
   } catch (err) {
     state.reject(err as Error);

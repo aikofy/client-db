@@ -32,6 +32,8 @@ export interface RpcLimits {
   maxPayloadBytes: number;
   defaultDeadlineMs: number;
   rateLimit: { perMin: number };
+  /** Max concurrent in-flight calls (unary + streams) per consumer session. */
+  maxInflight: number;
 }
 
 // ─── Client → server frames ─────────────────────────────────────────────────────
@@ -139,4 +141,5 @@ export const DEFAULT_LIMITS: RpcLimits = {
   maxPayloadBytes: 1 * 1024 * 1024, // 1 MB
   defaultDeadlineMs: 30_000,
   rateLimit: { perMin: 600 },
+  maxInflight: 64,
 };

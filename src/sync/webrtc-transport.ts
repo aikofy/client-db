@@ -44,6 +44,16 @@ interface CandidateBuffer {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
 const SIGNALING_TYPES = ['peer-list', 'offer', 'answer', 'ice-candidate'];
+// Incoming frame caps (UTF-16 units ≈ bytes): drop absurd frames BEFORE JSON.parse,
+// so a hostile/buggy sender can't force huge allocations. Gossip legitimately carries
+// 500-doc sync/snapshot batches → generous cap; RPC requests are server-capped at
+// ~1 MB params → a much tighter cap suffices.
+export const MAX_SYNC_MESSAGE_BYTES = 64 * 1024 * 1024; // 64 MB
+export const MAX_RPC_MESSAGE_BYTES = 4 * 1024 * 1024; //    4 MB
+// Bound the per-peer queue of messages awaiting channel-open. Dropping the oldest is
+// safe for gossip: anything dropped is re-pulled by a later sync round (watermarks
+// only advance on success).
+const MAX_PENDING_MESSAGES_PER_PEER = 256;
 
 export class WebRTCTransport {
   private config: WebRTCTransportConfig;
@@ -304,9 +314,11 @@ export class WebRTCTransport {
     channel.onclose = () => this._removePeer(peerId);
 
     channel.onmessage = (evt) => {
+      const raw = evt.data as unknown;
+      if (typeof raw !== 'string' || raw.length > MAX_SYNC_MESSAGE_BYTES) return;
       let msg: SyncMessage;
       try {
-        msg = JSON.parse(evt.data as string) as SyncMessage;
+        msg = JSON.parse(raw) as SyncMessage;
       } catch {
         return;
       }
@@ -385,9 +397,11 @@ export class WebRTCTransport {
     channel.onclose = () => this._removeConsumer(consumerId);
 
     channel.onmessage = (evt) => {
+      const raw = evt.data as unknown;
+      if (typeof raw !== 'string' || raw.length > MAX_RPC_MESSAGE_BYTES) return;
       let data: unknown;
       try {
-        data = JSON.parse(evt.data as string);
+        data = JSON.parse(raw);
       } catch {
         return;
       }
@@ -443,6 +457,9 @@ export class WebRTCTransport {
     } else {
       const queue = this.pendingMessages.get(peerId) ?? [];
       queue.push(message);
+      // A channel that never opens must not buffer unboundedly (a 500-doc page
+      // can be megabytes). Drop the oldest; gossip re-pulls it next round.
+      if (queue.length > MAX_PENDING_MESSAGES_PER_PEER) queue.shift();
       this.pendingMessages.set(peerId, queue);
     }
   }

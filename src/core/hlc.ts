@@ -2,6 +2,22 @@ import type { HLCTimestamp } from './types.js';
 
 const MS_DIGITS = 16;
 const COUNTER_DIGITS = 6;
+/** Counter ceiling before rolling into physical time (6 digits keeps lexicographic order). */
+const MAX_COUNTER = 999_999;
+/** nodeId length cap for wire-validated timestamps (uuids are 36 chars; allow custom ids). */
+const MAX_NODE_ID_LENGTH = 128;
+
+const HLC_RE = new RegExp(`^\\d{${MS_DIGITS}}-\\d{${COUNTER_DIGITS}}-.{1,${MAX_NODE_ID_LENGTH}}$`);
+
+/**
+ * True iff `ts` is a well-formed HLC string (`<ms_16>-<counter_6>-<nodeId>`).
+ * Use on every timestamp received from the network before feeding it to
+ * `parseHLC`/`HLC.update` — a malformed string would otherwise parse to NaN and
+ * corrupt the clock (and every `_rev` minted after it).
+ */
+export function isValidHLC(ts: unknown): ts is HLCTimestamp {
+  return typeof ts === 'string' && HLC_RE.test(ts);
+}
 
 function padMs(ms: number): string {
   return ms.toString().padStart(MS_DIGITS, '0');
@@ -53,6 +69,7 @@ export class HLC {
     } else {
       this.counter += 1;
     }
+    this._rollCounter();
     return formatHLC({ physicalMs: this.physicalMs, counter: this.counter, nodeId: this.nodeId });
   }
 
@@ -73,7 +90,17 @@ export class HLC {
       this.counter += 1;
     }
 
+    this._rollCounter();
     return formatHLC({ physicalMs: this.physicalMs, counter: this.counter, nodeId: this.nodeId });
+  }
+
+  /** A counter past 6 digits would break lexicographic ordering ("1000000" < "999999"
+   *  as strings) — roll it into physical time instead, preserving monotonicity. */
+  private _rollCounter(): void {
+    if (this.counter > MAX_COUNTER) {
+      this.physicalMs += 1;
+      this.counter = 0;
+    }
   }
 
   now(): HLCTimestamp {

@@ -8,6 +8,7 @@
  * the cache is injectable so it can be swapped later.
  */
 const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const PRUNE_INTERVAL_MS = 60 * 1000; // sweep expired entries at most once a minute
 
 interface Entry {
   promise: Promise<unknown>;
@@ -25,6 +26,7 @@ export class IdempotencyCache {
   private readonly map = new Map<string, Entry>();
   private readonly ttlMs: number;
   private readonly now: () => number;
+  private lastPruneAt = 0;
 
   constructor(opts: IdempotencyCacheOptions = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
@@ -32,7 +34,14 @@ export class IdempotencyCache {
   }
 
   run<T>(key: string, fn: () => T | Promise<T>): Promise<T> {
-    this._prune();
+    // Throttled sweep: pruning is O(entries) and purely GC — the lookup below
+    // already ignores expired entries, so correctness never depends on it. An
+    // every-call sweep would make a busy cache quadratic.
+    const t = this.now();
+    if (t - this.lastPruneAt >= PRUNE_INTERVAL_MS) {
+      this.lastPruneAt = t;
+      this._prune();
+    }
 
     const existing = this.map.get(key);
     if (existing && existing.expiresAt > this.now()) {

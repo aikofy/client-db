@@ -21,12 +21,23 @@ export async function logConflict(
   remote: Doc,
   resolved: Doc,
 ): Promise<void> {
-  await adapter.put('_conflicts', {
+  const record = {
     _id: `${collection}:${local._id}:${local._rev}:${remote._rev}`,
     collection,
     localDoc: local,
     remoteDoc: remote,
     resolvedDoc: resolved,
     detectedAt: new Date().toISOString(),
-  });
+  };
+  // Prefer the direct conflict-store write: a plain put() would tick the HLC,
+  // append a change-log entry and broadcast the record to every peer — conflict
+  // audits are local-only. Fall back to put() for custom adapters.
+  const direct = adapter as IStorageAdapter & {
+    putConflict?: (r: Record<string, unknown> & { _id: string }) => Promise<void>;
+  };
+  if (typeof direct.putConflict === 'function') {
+    await direct.putConflict(record);
+  } else {
+    await adapter.put('_conflicts', record);
+  }
 }

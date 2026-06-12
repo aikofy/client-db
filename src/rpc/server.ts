@@ -53,6 +53,12 @@ export interface RpcServerConfig {
 }
 
 const DEFAULT_READ_AFTER_TIMEOUT_MS = 2000;
+/** Cap on the auth token size — bounds the cost of a junk-token WebCrypto verify. */
+const MAX_TOKEN_LENGTH = 8192;
+/** Failed auth attempts allowed per connection before further attempts are refused.
+ *  Bounds online token brute-forcing/verifier-burn on a single channel; the counter
+ *  resets only by reconnecting (a new session). */
+const MAX_AUTH_FAILURES = 5;
 
 interface InflightCall {
   ac: AbortController;
@@ -67,6 +73,8 @@ interface Session {
   expiresAt?: number;
   inflight: Map<string, InflightCall>;
   bucket: TokenBucket;
+  /** Failed auth attempts on this connection (reset on success). */
+  authFailures: number;
 }
 
 /**
@@ -109,6 +117,7 @@ export class RpcServer {
       identity: null,
       inflight: new Map(),
       bucket: new TokenBucket(this.limits.rateLimit.perMin, Date.now()),
+      authFailures: 0,
     });
   }
 
@@ -180,6 +189,28 @@ export class RpcServer {
       return;
     }
 
+    // Refuse further attempts after repeated failures — without this, one connection
+    // can brute-force tokens or burn CPU on signature verifies without limit.
+    if (session.authFailures >= MAX_AUTH_FAILURES) {
+      this.config.send(consumerId, {
+        type: 'auth-err',
+        status: 'RESOURCE_EXHAUSTED',
+        message: 'too many failed authentication attempts; reconnect to retry',
+      });
+      return;
+    }
+
+    // Bound the token before any decode/verify work.
+    if (typeof frame.token !== 'string' || frame.token.length > MAX_TOKEN_LENGTH) {
+      session.authFailures += 1;
+      this.config.send(consumerId, {
+        type: 'auth-err',
+        status: 'UNAUTHENTICATED',
+        message: 'invalid token',
+      });
+      return;
+    }
+
     let identity: ConsumerIdentity | null;
     try {
       identity = this.config.verifyToken
@@ -190,6 +221,7 @@ export class RpcServer {
     }
 
     if (!identity) {
+      session.authFailures += 1;
       this.config.send(consumerId, {
         type: 'auth-err',
         status: 'UNAUTHENTICATED',
@@ -198,6 +230,7 @@ export class RpcServer {
       return;
     }
 
+    session.authFailures = 0;
     session.authenticated = true;
     session.identity = identity;
     const exp = identity.claims['exp'];
@@ -236,6 +269,12 @@ export class RpcServer {
     // Per-consumer rate limit.
     if (!session.bucket.tryRemove(start)) {
       reject('RESOURCE_EXHAUSTED', 'rate limit exceeded', 'unknown', true);
+      return;
+    }
+    // Concurrency cap: the rate limit alone doesn't stop a consumer holding open
+    // hundreds of long-lived streams/calls, each pinning server work and buffers.
+    if (session.inflight.size >= this.limits.maxInflight) {
+      reject('RESOURCE_EXHAUSTED', 'too many concurrent requests', 'unknown', true);
       return;
     }
     // Payload cap.

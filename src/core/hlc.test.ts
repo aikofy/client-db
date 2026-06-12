@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
-import { HLC, parseHLC } from './hlc.js';
+import { HLC, parseHLC, formatHLC, isValidHLC } from './hlc.js';
+import type { HLCTimestamp } from './types.js';
 
 describe('HLC', () => {
   it('tick() produces lexicographically ordered timestamps', () => {
@@ -70,5 +71,47 @@ describe('HLC', () => {
     // format: 0000000000000000-000000-abc
     expect(ts.startsWith('0'.repeat(16 - String(Date.now()).length))).toBeTruthy();
     expect(ts.endsWith(nodeId)).toBe(true);
+  });
+
+  it('counter overflow rolls into physical time, preserving lexicographic order', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    const hlc = new HLC('node-1');
+    // Force the counter to the 6-digit ceiling via a remote at the same physical ms.
+    const remote = formatHLC({ physicalMs: 1_700_000_000_000, counter: 999_999, nodeId: 'evil' });
+    hlc.tick(); // physicalMs = now, counter = 0
+    const before = hlc.now();
+    const rolled = hlc.update(remote); // max(0, 999999) + 1 → would be 1_000_000
+    const p = parseHLC(rolled);
+    expect(p.counter).toBe(0);
+    expect(p.physicalMs).toBe(1_700_000_000_001); // rolled into physical time
+    expect(rolled.length).toBe(before.length); // still 6-digit counter field
+    expect(rolled > remote).toBe(true); // monotonic vs the remote
+    expect(rolled > before).toBe(true); // monotonic vs our own past
+    vi.useRealTimers();
+  });
+});
+
+describe('isValidHLC', () => {
+  it('accepts real timestamps', () => {
+    const hlc = new HLC('node-1');
+    expect(isValidHLC(hlc.tick())).toBe(true);
+    expect(isValidHLC(formatHLC({ physicalMs: 0, counter: 0, nodeId: 'x' }))).toBe(true);
+  });
+
+  it('rejects malformed input that would corrupt the clock', () => {
+    expect(isValidHLC(undefined)).toBe(false);
+    expect(isValidHLC(null)).toBe(false);
+    expect(isValidHLC(42)).toBe(false);
+    expect(isValidHLC('')).toBe(false);
+    expect(isValidHLC('garbage')).toBe(false);
+    expect(isValidHLC('123-0-node')).toBe(false); // wrong field widths
+    expect(isValidHLC('000000000000000a-000000-node')).toBe(false); // non-digit ms
+    expect(isValidHLC('0000000000000000-000000-')).toBe(false); // empty nodeId
+    expect(isValidHLC(`0000000000000000-000000-${'n'.repeat(200)}`)).toBe(false); // nodeId too long
+  });
+
+  it('malformed strings rejected by isValidHLC would otherwise parse to NaN', () => {
+    expect(Number.isNaN(parseHLC('garbage' as HLCTimestamp).physicalMs)).toBe(true);
   });
 });

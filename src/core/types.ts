@@ -100,8 +100,14 @@ export interface SyncConfig {
   initialSnapshot?: Snapshot | Promise<Snapshot | null | undefined>;
   /** Days to keep change log entries. Older entries are pruned on startup and every 24 h.
    *  Peers with a watermark older than this TTL receive needsFullSync and re-bootstrap.
-   *  Default: 30. Set to 0 to disable pruning. */
+   *  Also bounds the `_conflicts` audit log. Default: 30. Set to 0 to disable pruning. */
   changeLogTtlDays?: number;
+  /** Reject remote docs whose HLC physical time is more than this far ahead of the local
+   *  clock. Bounds clock poisoning: without it, one peer with a far-future clock (malicious
+   *  or just wrong) permanently drags every replica's HLC forward, so its writes win LWW
+   *  against all later edits. Default: 24 h (tolerates realistic device skew). Set to
+   *  `Number.POSITIVE_INFINITY` to disable. */
+  maxClockDriftMs?: number;
   /** Whether this Normal Client accepts Consumer ('rpc') connections and serves their
    *  RPC calls. Advertised to the signaling server for load-balancer eligibility.
    *  Default: true. (Consumer RPC handling itself lands in Phase 2.) */

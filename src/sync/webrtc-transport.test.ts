@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { WebRTCTransport } from './webrtc-transport.js';
+import { WebRTCTransport, MAX_RPC_MESSAGE_BYTES } from './webrtc-transport.js';
 import type { SyncMessage } from '../core/types.js';
 import {
   installFakeWebRTC,
@@ -103,6 +103,48 @@ describe('WebRTCTransport — consumer isolation (Phase 1)', () => {
     t.disconnect();
     expect(t.consumers()).toEqual([]);
     expect(consumerDisconnected).toEqual(['cons1']);
+  });
+});
+
+describe('WebRTCTransport — frame and queue bounds', () => {
+  it('drops an oversized consumer frame before parsing, keeping the channel usable', async () => {
+    const hub = installFakeWebRTC();
+    const consumerMessages: unknown[] = [];
+
+    const t = makeNormal('normalA');
+    t.onConsumerMessage = (_id, data) => consumerMessages.push(data);
+    t.connect();
+
+    const consumer = new FakeConsumer('cons1', 'r1', hub);
+    await waitFor(() => consumer.serverList.length > 0);
+    await consumer.connectTo('normalA', 'rpc');
+    await waitFor(() => t.consumers().length === 1);
+
+    // An over-cap frame is discarded without a JSON.parse allocation storm…
+    consumer.send({ junk: 'x'.repeat(MAX_RPC_MESSAGE_BYTES + 1024) });
+    await tick();
+    expect(consumerMessages.length).toBe(0);
+
+    // …and the channel still works for well-behaved frames afterwards.
+    consumer.send({ ok: true });
+    await waitFor(() => consumerMessages.length === 1);
+    expect(consumerMessages[0]).toEqual({ ok: true });
+
+    t.disconnect();
+  });
+
+  it('bounds the pending queue for a peer whose channel never opens', () => {
+    installFakeWebRTC();
+    const t = makeNormal('normalA');
+    // No connection at all — every send() lands in the pending queue.
+    for (let i = 0; i < 400; i++) {
+      t.send('ghost', { type: 'peer-hello', nodeId: 'normalA', currentHLC: String(i) } as unknown as SyncMessage);
+    }
+    const pending = (t as unknown as { pendingMessages: Map<string, SyncMessage[]> }).pendingMessages;
+    const queue = pending.get('ghost')!;
+    expect(queue.length).toBe(256); // capped, oldest dropped
+    expect((queue[0] as unknown as { currentHLC: string }).currentHLC).toBe('144'); // 400 - 256
+    t.disconnect();
   });
 });
 

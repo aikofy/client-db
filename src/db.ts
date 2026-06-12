@@ -1,4 +1,4 @@
-import { IndexedDBAdapter } from './storage/indexeddb.js';
+import { IndexedDBAdapter, type BatchOp } from './storage/indexeddb.js';
 import { WebRTCTransport } from './sync/webrtc-transport.js';
 import { GossipSync } from './sync/gossip.js';
 import { RpcServer } from './rpc/server.js';
@@ -36,7 +36,8 @@ export interface RpcConfig {
   /** Max time (ms) to wait for the local replica to catch up to a request's `readAfter`
    *  watermark before replying UNAVAILABLE. Default 2000. */
   readAfterTimeoutMs?: number;
-  /** Override server limits: `maxPayloadBytes`, `defaultDeadlineMs`, `rateLimit.perMin`. */
+  /** Override server limits: `maxPayloadBytes`, `defaultDeadlineMs`, `rateLimit.perMin`,
+   *  `maxInflight`. */
   limits?: RpcServerConfig['limits'];
   /** Observability hook — invoked once per Consumer call (metrics/audit). */
   onCall?: RpcServerConfig['onCall'];
@@ -57,6 +58,19 @@ export interface CollectionProxy<T extends Record<string, unknown> = Record<stri
   delete(id: string): Promise<void>;
   onChange(cb: ChangeCallback): () => void;
 }
+
+/** Staging surface inside `db.transaction(fn)` — collects writes, commits nothing itself. */
+export interface TxCollectionProxy<T extends Record<string, unknown> = Record<string, unknown>> {
+  /** Stage an upsert. System fields are stamped at commit. */
+  put(doc: T & { _id?: string }): void;
+  /** Stage a soft-delete. A missing id is a committed no-op (same as `delete()`). */
+  delete(id: string): void;
+}
+
+/** The collections map handed to a `db.transaction(fn)` callback. */
+export type TransactionProxy<C extends Record<string, CollectionSchema>> = {
+  [K in keyof C]: TxCollectionProxy;
+};
 
 /** Base methods available on every DB instance. */
 export interface DBBase {
@@ -80,6 +94,26 @@ export interface DBBase {
  */
 export type TypedDB<C extends Record<string, CollectionSchema>> = DBBase & {
   [K in keyof C]: CollectionProxy;
+} & {
+  /**
+   * Atomic write batch. `fn` runs synchronously and only STAGES puts/deletes
+   * (no reads — read before, write inside); everything staged then commits in
+   * ONE IndexedDB transaction, together with the change-log entries and HLC
+   * watermark. All-or-nothing: if any write fails, nothing is persisted, no
+   * change events fire, nothing is broadcast. Resolves with the committed docs
+   * in op order (tombstones included; no-op deletes omitted).
+   *
+   * Atomicity is LOCAL. Peers receive the batch as one frame per collection and
+   * bulk-apply it, but conflict resolution stays per-doc — a concurrent remote
+   * edit can win LWW for one doc of the batch and lose for another.
+   *
+   *   await db.transaction((tx) => {
+   *     tx.orders.put({ _id: orderId, status: 'placed' });
+   *     tx.orderItems.put({ orderId, sku: 'a' });
+   *     tx.carts.delete(cartId);
+   *   });
+   */
+  transaction(fn: (tx: TransactionProxy<C>) => void): Promise<Doc[]>;
 };
 
 function makeCollectionProxy<T extends Record<string, unknown>>(
@@ -139,14 +173,15 @@ async function _createDB<C extends Record<string, CollectionSchema>>(
 
   const changeListeners = new Map<string, Set<ChangeCallback>>();
 
-  adapter.onChangeEntry((entry, doc) => {
-    const cbs = changeListeners.get(entry.collection);
+  adapter.onChangeBatch((collection, entries, docs) => {
+    const cbs = changeListeners.get(collection);
     if (cbs && cbs.size > 0) {
-      for (const cb of cbs) cb([entry]);
+      for (const cb of cbs) cb(entries);
     }
-    // The doc is already in hand from the write — broadcast it directly instead
-    // of re-reading it from IndexedDB.
-    if (gossip) gossip.broadcastDoc(entry.collection, doc);
+    // The docs are already in hand from the write — broadcast them directly
+    // instead of re-reading from IndexedDB, and as ONE message per committed
+    // batch (a 1000-doc bulkInsert is 1 frame per peer, not 1000).
+    if (gossip) gossip.broadcastDocs(collection, docs);
   });
 
   let transport: WebRTCTransport | null = null;
@@ -174,6 +209,7 @@ async function _createDB<C extends Record<string, CollectionSchema>>(
       adapter,
       config.collections as Record<string, CollectionSchema>,
       config.sync.changeLogTtlDays,
+      config.sync.maxClockDriftMs,
     );
 
     const SYNC_SETTLE_MS = 1500;
@@ -194,7 +230,8 @@ async function _createDB<C extends Record<string, CollectionSchema>>(
       try {
         const snapshot = await Promise.resolve(config.sync.initialSnapshot);
         if (snapshot) {
-          const existing = await adapter.changes('0' as HLCTimestamp);
+          // Existence check only — limit 1 instead of materializing the whole log.
+          const existing = await adapter.changes('0' as HLCTimestamp, 1);
           if (existing.length === 0) await adapter.import(snapshot);
         }
       } catch {
@@ -257,6 +294,26 @@ async function _createDB<C extends Record<string, CollectionSchema>>(
 
     async importStream(chunks: AsyncIterable<SnapshotChunk>): Promise<void> {
       await adapter.importStream(chunks);
+    },
+
+    async transaction(fn: (tx: TransactionProxy<C>) => void): Promise<Doc[]> {
+      // Staging is synchronous and pure JS — the IndexedDB transaction is opened
+      // only afterwards, inside applyBatch, so it can never auto-commit early
+      // under a user `await` (the classic IndexedDB transaction footgun).
+      const ops: BatchOp[] = [];
+      const staging: Record<string, TxCollectionProxy> = {};
+      for (const name of Object.keys(config.collections)) {
+        staging[name] = {
+          put(doc) {
+            ops.push({ type: 'put', collection: name, doc });
+          },
+          delete(id) {
+            ops.push({ type: 'delete', collection: name, id });
+          },
+        };
+      }
+      fn(staging as TransactionProxy<C>);
+      return adapter.applyBatch(ops);
     },
 
     get syncStatus(): SyncStatus {

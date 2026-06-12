@@ -1,6 +1,6 @@
 {
   "name": "@aikofy/client-db",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Offline-first, peer-to-peer IndexedDB sync (HLC, CRDT conflict resolution, WebRTC gossip) with a Consumer Client RPC layer for thin clients that call functions instead of replicating",
   "type": "module",
   "main": "./dist/index.cjs",
