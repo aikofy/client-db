@@ -3,6 +3,32 @@
 All notable changes to `@aikofy/client-db` are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.2.0
+
+Sync-safe disk-space reclamation. New public API, no breaking changes.
+
+### Added
+
+- **`db.compact(options?)`** — physically removes tombstone documents **in place** (no
+  close/reopen, while the DB stays open and serving), reclaiming IndexedDB space that soft
+  `delete()` left behind. A tombstone is purged only once its `_rev` is older than the change-log
+  TTL horizon (`options.olderThanMs`, default `changeLogTtlDays` = 30 days): any peer that hasn't
+  seen the deletion is already past the change-log watermark, so it is sent `needsFullSync` and
+  re-bootstraps from a snapshot that contains neither the doc nor its tombstone — **no
+  resurrection**. Within the horizon tombstones are retained so deletions still propagate as
+  deltas. Local-only (no HLC tick / change-log entry / gossip), idempotent, crash-safe, and
+  cursor-paged for multi-GB stores. Returns `{ tombstonesPurged, collections, bytesReclaimed? }`.
+  An optional `predicate` also soft-deletes (replicated) matching live docs.
+- **`IStorageAdapter.pruneTombstones(olderThanMs)`** — the sync-safe primitive `compact()` builds
+  on (parallel to `pruneChanges`); returns the number of tombstones purged. *(Custom adapters must
+  implement this new interface method.)*
+- **`SyncConfig.autoCompact`** (default `false`) — when enabled, tombstone reclamation runs on the
+  existing 24 h maintenance cycle, right after the change-log prune.
+- **`db.hardDelete(collection, id)`** — ⚠️ sync-unsafe immediate physical removal of a single
+  record (no HLC tick / change-log entry / gossip) for admin / non-synced contexts; a still-holding
+  peer can resurrect it, so use `delete()` + `compact()` for anything replicated.
+- New exported types `CompactOptions` and `CompactResult`.
+
 ## 2.1.0
 
 Performance, security, and large-dataset hardening. No breaking API changes.

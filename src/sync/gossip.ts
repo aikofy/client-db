@@ -45,6 +45,7 @@ export class GossipSync {
   private pendingRequests = new Map<string, (msg: SyncResponseMessage) => void>();
   private onlineListener: (() => void) | null = null;
   private readonly ttlMs: number;
+  private readonly autoCompact: boolean;
   private stopped = false;
   /** peers with an in-flight _syncWithPeer, to avoid overlapping duplicate syncs. */
   private readonly _syncing = new Set<string>();
@@ -65,12 +66,14 @@ export class GossipSync {
     collections: Record<string, CollectionSchema>,
     ttlDays = 30,
     maxClockDriftMs = DEFAULT_MAX_CLOCK_DRIFT_MS,
+    autoCompact = false,
   ) {
     this.transport = transport;
     this.adapter = adapter;
     this.collections = collections;
     this.ttlMs = ttlDays > 0 ? ttlDays * 24 * 60 * 60 * 1000 : 0;
     this.maxClockDriftMs = maxClockDriftMs;
+    this.autoCompact = autoCompact;
   }
 
   /** True iff `ts` is a well-formed HLC whose physical time is not unacceptably far
@@ -111,7 +114,18 @@ export class GossipSync {
 
     if (this.ttlMs > 0) {
       const prune = (): void => {
-        void this.adapter.pruneChanges(this.ttlMs);
+        // Prune the change log first, then (opt-in) physically reclaim tombstones
+        // that have now aged past it. pruneChanges advances the oldest-change
+        // watermark, which is exactly what makes the tombstone purge sync-safe:
+        // any peer older than the horizon is forced to re-bootstrap (needsFullSync)
+        // rather than miss the deletion. pruneTombstones runs AFTER it, in the same
+        // cycle, only when autoCompact is enabled.
+        void this.adapter
+          .pruneChanges(this.ttlMs)
+          .then(() => {
+            if (this.autoCompact) return this.adapter.pruneTombstones(this.ttlMs);
+          })
+          .catch((err) => queueMicrotask(() => { throw err; }));
         // The conflict audit log shares the TTL — without pruning it grows forever.
         void this.adapter.pruneConflicts(this.ttlMs);
       };

@@ -28,6 +28,8 @@ export type {
   ConflictStrategy,
   IndexDef,
   CollectionSchema,
+  CompactOptions,
+  CompactResult,
   IceServer,
   SyncConfig,
   DBConfig,

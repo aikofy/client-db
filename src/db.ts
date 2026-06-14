@@ -14,9 +14,15 @@ import type {
   SnapshotChunk,
   ChangeEntry,
   CollectionSchema,
+  CompactOptions,
+  CompactResult,
 } from './core/types.js';
 
 export type SyncStatus = 'online' | 'offline' | 'syncing';
+
+/** Fallback tombstone-compaction horizon when sync (and thus `changeLogTtlDays`) is absent. */
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const DEFAULT_TTL_DAYS = 30;
 
 /**
  * Turns a Normal Client into an RPC server for Consumer Clients. `router` holds the
@@ -84,6 +90,30 @@ export interface DBBase {
   exportStream(batchSize?: number): AsyncGenerator<SnapshotChunk>;
   /** Streaming restore — consumes chunks from `exportStream` (or NDJSON). */
   importStream(chunks: AsyncIterable<SnapshotChunk>): Promise<void>;
+  /**
+   * Physically reclaim IndexedDB disk space in place — while the DB stays open and
+   * serving — by removing tombstone (`_deleted`) documents whose deletion predates
+   * the horizon (`options.olderThanMs`, default `changeLogTtlDays`, i.e. 30 d).
+   *
+   * SYNC-SAFE. A tombstone is only purged once it is older than the change-log TTL
+   * horizon: any peer that has not yet seen the deletion is, by definition, past the
+   * change-log watermark, so it is forced to re-bootstrap from a full snapshot
+   * (`needsFullSync`) — which contains neither the live doc nor the tombstone, so
+   * the record is correctly absent and never resurrects. Within the horizon
+   * tombstones are retained so deletions still propagate as deltas. Local-only: no
+   * HLC tick, change-log entry, or gossip. Idempotent and crash-safe.
+   *
+   *   const { tombstonesPurged, bytesReclaimed } = await db.compact();
+   */
+  compact(options?: CompactOptions): Promise<CompactResult>;
+  /**
+   * ⚠️ SYNC-UNSAFE — physically remove ONE record (live or tombstone) immediately,
+   * without ticking the HLC, logging a change, or gossiping. Peers are never told,
+   * so a still-holding peer can RESURRECT it via normal sync. For admin / non-synced
+   * contexts only. Use `delete()` for replicated removal and `compact()` to reclaim
+   * tombstone space safely. Returns true if a record was removed.
+   */
+  hardDelete(collection: string, id: string): Promise<boolean>;
   readonly syncStatus: SyncStatus;
   close(): Promise<void>;
 }
@@ -210,6 +240,7 @@ async function _createDB<C extends Record<string, CollectionSchema>>(
       config.collections as Record<string, CollectionSchema>,
       config.sync.changeLogTtlDays,
       config.sync.maxClockDriftMs,
+      config.sync.autoCompact,
     );
 
     const SYNC_SETTLE_MS = 1500;
@@ -294,6 +325,20 @@ async function _createDB<C extends Record<string, CollectionSchema>>(
 
     async importStream(chunks: AsyncIterable<SnapshotChunk>): Promise<void> {
       await adapter.importStream(chunks);
+    },
+
+    async compact(options?: CompactOptions): Promise<CompactResult> {
+      // Default the horizon to the change-log TTL so tombstone GC piggybacks on the
+      // exact same watermark machinery that drives needsFullSync. With TTL disabled
+      // (0) or no sync configured, fall back to 30 days.
+      const ttlDays = config.sync?.changeLogTtlDays;
+      const horizonDays = ttlDays !== undefined && ttlDays > 0 ? ttlDays : DEFAULT_TTL_DAYS;
+      const olderThanMs = options?.olderThanMs ?? horizonDays * MS_PER_DAY;
+      return adapter.compact({ ...options, olderThanMs });
+    },
+
+    async hardDelete(collection: string, id: string): Promise<boolean> {
+      return adapter.hardDelete(collection, id);
     },
 
     async transaction(fn: (tx: TransactionProxy<C>) => void): Promise<Doc[]> {

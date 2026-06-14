@@ -13,10 +13,16 @@ import type {
   Snapshot,
   SnapshotChunk,
   CollectionSchema,
+  CompactOptions,
+  CompactResult,
 } from '../core/types.js';
 
 const META_STORE = '_meta';
 const BULK_INSERT_BATCH_SIZE = 1000;
+/** Tombstones scanned per IndexedDB transaction during compaction. Caps peak memory. */
+const COMPACT_BATCH_SIZE = 1000;
+/** Default tombstone-purge horizon when no TTL / explicit value is supplied (30 days). */
+const DEFAULT_COMPACT_HORIZON_MS = 30 * 24 * 60 * 60 * 1000;
 const CONFLICTS_STORE = '_conflicts';
 const SYSTEM_STORES = [CHANGES_STORE, META_STORE, CONFLICTS_STORE];
 
@@ -843,6 +849,186 @@ export class IndexedDBAdapter implements IStorageAdapter {
     await tx.done;
   }
 
+  /**
+   * Physically remove tombstones older than `olderThanMs` ms, reclaiming space in
+   * place. Sync-safe primitive behind `compact()` — see the IStorageAdapter JSDoc.
+   * Returns the number of tombstones purged. Accepts an optional collection subset
+   * and page size (the interface signature exposes only `olderThanMs`).
+   */
+  async pruneTombstones(
+    olderThanMs: number,
+    options: { collections?: string[]; batchSize?: number } = {},
+  ): Promise<number> {
+    const { tombstonesPurged } = await this._purgeTombstones(olderThanMs, options);
+    return tombstonesPurged;
+  }
+
+  /** Core tombstone purge: cursor-paged over the `_updatedAt` index, one bounded
+   *  readwrite transaction per page. Returns purge count + reclaimed bytes. */
+  private async _purgeTombstones(
+    olderThanMs: number,
+    options: { collections?: string[]; batchSize?: number } = {},
+  ): Promise<CompactResult> {
+    const cutoffMs = Date.now() - olderThanMs;
+    const cutoffHlc = formatHLC({ physicalMs: cutoffMs, counter: 0, nodeId: '' });
+    // The oldest surviving change entry is the sync-safety floor: only purge a
+    // tombstone strictly older than it, so (a) its delete delta is already pruned
+    // (no peer can be sent a delete with no doc) and (b) any peer lagging the
+    // deletion is past the watermark → needsFullSync. Sampled once; the watermark
+    // only moves forward, so one read stays conservative for the whole run. When
+    // the change log is empty (oldest === null) there is no pending delta at all,
+    // so the wall-clock horizon alone is sufficient.
+    const oldest = await this.getOldestChangesHlc();
+    const size = Math.max(1, Math.trunc(options.batchSize ?? COMPACT_BATCH_SIZE));
+
+    const all = await this.collectionNames();
+    const targets = options.collections
+      ? options.collections.filter((c) => all.includes(c))
+      : all;
+
+    let tombstonesPurged = 0;
+    let bytesReclaimed = 0;
+
+    for (const collection of targets) {
+      // Keyset-page the `_updatedAt` index by an exclusive lower watermark so
+      // skipped (live / not-yet-safe) records are never re-scanned — O(records ≤
+      // cutoff) total, bounded memory per page. For a tombstone `_rev ===
+      // _updatedAt`, so an `_updatedAt`-bounded scan is exactly an `_rev`-bounded
+      // scan. (`_deleted` can't be indexed — boolean keys are invalid — so it is
+      // filtered per record.) A concurrent write mints a `_updatedAt` > now > the
+      // cutoff, landing outside the range, so an actively-revived doc is never hit.
+      let afterKey: string | null = null;
+      for (;;) {
+        const tx = this.db.transaction(collection, 'readwrite');
+        const index = tx.objectStore(collection).index('_updatedAt');
+        const range =
+          afterKey === null
+            ? IDBKeyRange.upperBound(cutoffHlc, false)
+            : IDBKeyRange.bound(afterKey, cutoffHlc, true, false);
+        let cursor = await index.openCursor(range);
+        let scanned = 0;
+        let lastKey: string | null = null;
+        const deletes: Promise<void>[] = [];
+        while (cursor && scanned < size) {
+          const rec = cursor.value as Doc;
+          lastKey = rec._updatedAt as string;
+          scanned++;
+          if (
+            rec._deleted === true &&
+            (rec._rev as string) <= cutoffHlc &&
+            (oldest === null || (rec._rev as string) < oldest)
+          ) {
+            bytesReclaimed += _approxBytes(rec);
+            deletes.push(cursor.delete()); // fire; only continue() round-trips per entry
+            tombstonesPurged++;
+          }
+          cursor = await cursor.continue();
+        }
+        await Promise.all(deletes);
+        await tx.done;
+        // Fewer than a full page scanned ⇒ the range is exhausted.
+        if (lastKey === null || scanned < size) break;
+        afterKey = lastKey;
+      }
+    }
+
+    return { tombstonesPurged, collections: targets.length, bytesReclaimed };
+  }
+
+  /**
+   * Physically reclaim tombstone disk space in place (no close/reopen), across all
+   * user collections or `options.collections`. Tombstones whose `_rev` predates the
+   * horizon (`options.olderThanMs`, default 30 d) are removed. SYNC-SAFE: the same
+   * horizon is first applied to the change log (`pruneChanges`), which advances the
+   * oldest-change watermark so the purge is both effective and correct — any peer
+   * offline longer than the horizon is forced to re-bootstrap (`needsFullSync`) and
+   * the deletion can never resurrect. Local-only: no HLC tick, change entry, or
+   * gossip. Idempotent and crash-safe. See `CompactOptions` for `predicate`.
+   */
+  async compact(options: CompactOptions = {}): Promise<CompactResult> {
+    const olderThanMs = options.olderThanMs ?? DEFAULT_COMPACT_HORIZON_MS;
+
+    // 1. Optional: drop live docs the consumer no longer wants. These are ordinary
+    //    (replicated) deletes — fresh tombstones now, reclaimed by a later compaction.
+    if (options.predicate) {
+      await this._deleteMatchingLive(options.collections, options.predicate, options.batchSize);
+    }
+
+    // 2. Prune the change log to the SAME horizon first — advances the oldest-change
+    //    watermark so step 3 can purge, and is what makes physical removal sync-safe.
+    await this.pruneChanges(olderThanMs);
+
+    // 3. Physically purge eligible tombstones.
+    return this._purgeTombstones(olderThanMs, {
+      collections: options.collections,
+      batchSize: options.batchSize,
+    });
+  }
+
+  /** Soft-delete (replicated) every live doc matching `predicate`. Collects ids
+   *  first (bounded by match count) so scan reads and delete writes don't interleave. */
+  private async _deleteMatchingLive(
+    collections: string[] | undefined,
+    predicate: (doc: Doc) => boolean,
+    batchSize?: number,
+  ): Promise<void> {
+    const all = await this.collectionNames();
+    const targets = collections ? collections.filter((c) => all.includes(c)) : all;
+    for (const collection of targets) {
+      const ids: string[] = [];
+      for await (const doc of this.scan(collection, { batchSize })) {
+        if (predicate(doc)) ids.push(doc._id);
+      }
+      for (const id of ids) await this.delete(collection, id);
+    }
+  }
+
+  /**
+   * Physically remove a single record (live doc or tombstone) from `collection`,
+   * reclaiming its space immediately. Returns true if a record was removed.
+   *
+   * ⚠️ SYNC-UNSAFE — admin / non-replicated use only. Unlike `delete()` this does
+   * NOT tick the HLC, append a change-log entry, or gossip, so peers are never told
+   * the record is gone. If any peer still holds the doc, ordinary gossip will
+   * re-introduce it here — i.e. it can RESURRECT. For replicated removal use
+   * `delete()`; to reclaim tombstone space safely use `compact()` / `pruneTombstones()`.
+   */
+  async hardDelete(collection: string, id: string): Promise<boolean> {
+    const tx = this.db.transaction(collection, 'readwrite');
+    const store = tx.objectStore(collection);
+    const existing = await store.get(id);
+    if (existing === undefined) {
+      await tx.done;
+      return false;
+    }
+    await store.delete(id);
+    await tx.done;
+    return true;
+  }
+
+  /**
+   * Approximate stored size (sum of UTF-16 JSON length, tombstones included) of the
+   * given collections, default all. Bounded memory (keyset-paged). A usage proxy
+   * for telemetry/tests — not an exact on-disk byte count.
+   */
+  async estimateSizeBytes(collections?: string[], batchSize = COMPACT_BATCH_SIZE): Promise<number> {
+    const all = await this.collectionNames();
+    const targets = collections ? collections.filter((c) => all.includes(c)) : all;
+    const size = Math.max(1, Math.trunc(batchSize));
+    let total = 0;
+    for (const collection of targets) {
+      let afterId: string | null = null;
+      for (;;) {
+        const docs = await this._querySnapshotBatch(collection, afterId, size);
+        if (docs.length === 0) break;
+        for (const d of docs) total += _approxBytes(d);
+        afterId = docs[docs.length - 1]._id;
+        if (docs.length < size) break;
+      }
+    }
+    return total;
+  }
+
   async getOldestChangesHlc(): Promise<HLCTimestamp | null> {
     const cached = await this.getMetaValue('oldestChangesHlc');
     if (cached !== undefined && cached !== null) return cached as HLCTimestamp;
@@ -862,5 +1048,14 @@ export class IndexedDBAdapter implements IStorageAdapter {
     const tx = this.db.transaction(META_STORE, 'readwrite');
     await tx.store.put({ key, value });
     await tx.done;
+  }
+}
+
+/** Approximate byte size of a record (UTF-16 JSON length). Cheap usage proxy. */
+function _approxBytes(doc: unknown): number {
+  try {
+    return JSON.stringify(doc).length;
+  } catch {
+    return 0;
   }
 }

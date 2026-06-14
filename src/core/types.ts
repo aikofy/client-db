@@ -43,6 +43,46 @@ export interface ScanOptions<T extends Record<string, unknown> = Record<string, 
   batchSize?: number;
 }
 
+// ─── Compaction ─────────────────────────────────────────────────────────────
+
+export interface CompactOptions {
+  /**
+   * A tombstone is eligible for physical removal once its `_rev` HLC is older than
+   * `Date.now() - olderThanMs` (i.e. it was deleted before that wall-clock instant).
+   * Defaults to `changeLogTtlDays` (30 d) expressed in ms.
+   *
+   * SYNC SAFETY: the horizon is also applied to the change log — `compact()` prunes
+   * change entries older than `olderThanMs` first, which is what forces any peer
+   * that has been offline longer than the horizon to re-bootstrap from a full
+   * snapshot (`needsFullSync`) instead of receiving a now-doc-less delete delta.
+   * Passing a horizon SHORTER than `changeLogTtlDays` therefore tightens the
+   * re-bootstrap boundary for the whole replica — only do so deliberately.
+   */
+  olderThanMs?: number;
+  /** Restrict compaction to these collections. Default: all user collections. */
+  collections?: string[];
+  /** Tombstones scanned per IndexedDB transaction. Caps peak memory. Default 1000. */
+  batchSize?: number;
+  /**
+   * LOCALLY DESTRUCTIVE + REPLICATED. When provided, every LIVE doc matching the
+   * predicate is soft-deleted (an ordinary `delete()`, so it ticks the HLC, enters
+   * the change log and gossips to peers as a deletion). The matched docs become
+   * tombstones now and are only physically reclaimed by a *later* compaction once
+   * they age past the horizon. Use to drop live data the consumer no longer wants.
+   */
+  predicate?: (doc: Doc) => boolean;
+}
+
+export interface CompactResult {
+  /** Number of tombstone documents physically removed from collection stores. */
+  tombstonesPurged: number;
+  /** Number of collections scanned. */
+  collections: number;
+  /** Approximate bytes of tombstone payload reclaimed (sum of UTF-16 JSON length
+   *  of each purged record). A lower-bound proxy for on-disk space freed. */
+  bytesReclaimed?: number;
+}
+
 // ─── Change log ───────────────────────────────────────────────────────────────
 
 export type ChangeOperation = 'put' | 'delete';
@@ -112,6 +152,12 @@ export interface SyncConfig {
    *  RPC calls. Advertised to the signaling server for load-balancer eligibility.
    *  Default: true. (Consumer RPC handling itself lands in Phase 2.) */
   serveConsumers?: boolean;
+  /** Physically reclaim tombstone disk space on the existing 24 h maintenance cycle.
+   *  When true, tombstones older than `changeLogTtlDays` are purged right after the
+   *  change-log prune (which is exactly what makes the purge sync-safe). Off by
+   *  default — opt in once you understand the no-resurrection boundary. Requires
+   *  `changeLogTtlDays > 0` (the horizon the purge piggybacks on). Default: false. */
+  autoCompact?: boolean;
 }
 
 // ─── DB config ────────────────────────────────────────────────────────────────
@@ -178,6 +224,22 @@ export interface IStorageAdapter {
 
   /** Delete change log entries older than `olderThanMs` milliseconds and update the cached oldest-entry watermark. */
   pruneChanges(olderThanMs: number): Promise<void>;
+
+  /**
+   * Physically remove tombstone (`_deleted=true`) documents whose `_rev` HLC is
+   * older than `olderThanMs` ms, reclaiming IndexedDB space in place. Returns the
+   * number of tombstones purged.
+   *
+   * SYNC-SAFE primitive that `compact()` builds on (parallel to `pruneChanges`):
+   * a tombstone is only purged when it is BOTH older than the wall-clock horizon
+   * AND strictly older than `getOldestChangesHlc()`. The latter guarantees the
+   * deletion's change-log entry is already gone (so no peer can be sent a delete
+   * delta with no doc to carry) and that any peer lagging behind the deletion is
+   * forced to `needsFullSync` → no resurrection. Local-only: never ticks the HLC,
+   * appends a change entry, or gossips. Idempotent and crash-safe (one bounded
+   * transaction per page; a partial run leaves every store + index consistent).
+   */
+  pruneTombstones(olderThanMs: number): Promise<number>;
 
   /** Return the _updatedAt HLC of the oldest surviving change entry, or null if the log is empty. */
   getOldestChangesHlc(): Promise<HLCTimestamp | null>;

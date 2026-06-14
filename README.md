@@ -19,6 +19,7 @@ A TypeScript-first, offline-ready, peer-to-peer syncing database for web browser
 - **Pluggable conflict resolution** — Last-Write-Wins (default), First-Write-Wins, or a custom resolver per collection
 - **Change origin** — `onChange` callbacks receive `origin: 'local' | 'peer'` so you can distinguish your own writes from incoming sync changes
 - **Soft deletes** — tombstones preserve sync integrity; deleted records are never lost
+- **Sync-safe compaction** — `compact()` physically reclaims tombstone disk space in place once deletions age past the sync horizon, with no risk of resurrection. See [Reclaiming disk space](#reclaiming-disk-space-compaction).
 - **Delta sync** — only changes since last sync are exchanged, not full datasets
 - **Snapshot bootstrap** — new peers receive a full snapshot then switch to delta sync automatically
 - **Consumer Clients (RPC)** — thin clients that hold no data and call a Normal Client's
@@ -435,7 +436,7 @@ window.addEventListener('beforeunload', async () => {
 const db = await createDB(config: DBConfig);
 ```
 
-Returns a `TypedDB<C>` — an object where each key of `collections` is a `CollectionProxy`, plus `export`, `import`, `syncStatus`, and `close`.
+Returns a `TypedDB<C>` — an object where each key of `collections` is a `CollectionProxy`, plus `export`, `import`, `compact`, `hardDelete`, `syncStatus`, and `close`.
 
 #### `DBConfig`
 
@@ -464,6 +465,7 @@ Returns a `TypedDB<C>` — an object where each key of `collections` is a `Colle
 | `changeLogTtlDays` | `number` (optional) | Days to keep change-log entries (and `_conflicts` audit records). Pruned on startup and every 24 h. Default `30`; `0` disables pruning. |
 | `maxClockDriftMs` | `number` (optional) | Reject remote docs whose HLC is further than this ahead of the local clock — bounds **clock poisoning** by a peer with a far-future clock. Default 24 h; `Number.POSITIVE_INFINITY` disables. |
 | `serveConsumers` | `boolean` (optional) | Whether this Normal Client accepts Consumer (`rpc`) connections. Default `true`. |
+| `autoCompact` | `boolean` (optional) | Physically reclaim tombstone disk space on the existing 24 h maintenance cycle (right after the change-log prune). Default `false` — opt in once you understand the [no-resurrection boundary](#reclaiming-disk-space-compaction). Requires `changeLogTtlDays > 0`. |
 
 ---
 
@@ -501,7 +503,7 @@ const results = await db.todos.query({
 
 #### `delete(id)`
 
-Soft delete — sets `_deleted: true` with a new HLC revision. The record remains in IndexedDB and is synced as a deletion event to peers immediately.
+Soft delete — sets `_deleted: true` with a new HLC revision. The record remains in IndexedDB (as a *tombstone*) and is synced as a deletion event to peers immediately. Tombstones are retained so the deletion can propagate; to physically reclaim their space once they age past the sync horizon, see [Reclaiming disk space (compaction)](#reclaiming-disk-space-compaction).
 
 #### `onChange(callback)`
 
@@ -664,6 +666,39 @@ Each stage holds only one batch (`batchSize` docs) at a time, so memory stays fl
 
 ---
 
+### Reclaiming disk space (compaction)
+
+`delete()` is a **soft delete**: it stamps `_deleted: true` and a new HLC `_rev`, but the tombstone document stays physically in IndexedDB so the deletion can still propagate to peers. Over time tombstones (and pruned history) accumulate with no in-place way to shrink the DB. `compact()` physically removes tombstones **in place** — no close/reopen, while the DB stays open and serving:
+
+```typescript
+const { tombstonesPurged, collections, bytesReclaimed } = await db.compact();
+// → purges tombstones whose deletion predates the horizon (default: changeLogTtlDays = 30 days)
+
+// Tune the horizon / scope:
+await db.compact({ olderThanMs: 7 * 24 * 60 * 60 * 1000, collections: ['todos'], batchSize: 500 });
+
+// Also drop live docs you no longer want (replicated as ordinary deletes):
+await db.compact({ predicate: (doc) => doc.archivedYearsAgo > 5 });
+```
+
+#### Why it's sync-safe (the no-resurrection boundary)
+
+A tombstone is only purged once its `_rev` is **older than the change-log TTL horizon**. Any peer that has not yet observed that deletion is, by definition, already past the change-log watermark — so on its next sync it is sent `needsFullSync` and re-bootstraps from a full snapshot. That snapshot contains **neither** the live doc **nor** its tombstone, so the record is correctly absent and never resurrects. **Within** the horizon, tombstones are retained so deletions keep propagating as deltas. Compaction piggybacks on the exact same TTL/watermark machinery as the change-log prune (`changeLogTtlDays`), so each node compacts its own replica independently — no cross-peer coordination needed.
+
+Compaction is **local-only** (never ticks the HLC, appends a change-log entry, or gossips), **idempotent**, and **crash-safe** (one bounded transaction per page; a partial run leaves every store and its indexes consistent). It pages by cursor, so it is safe on multi-GB stores.
+
+Enable it automatically on the 24 h maintenance cycle with `sync.autoCompact: true`, or call `db.compact()` yourself (e.g. on app idle).
+
+| Method | Returns | Notes |
+|--------|---------|-------|
+| `db.compact(options?)` | `Promise<CompactResult>` | Purge tombstones older than `options.olderThanMs` (default `changeLogTtlDays`, i.e. 30 days) across all collections or `options.collections`. `CompactResult` = `{ tombstonesPurged, collections, bytesReclaimed? }`. |
+| `db.hardDelete(collection, id)` | `Promise<boolean>` | ⚠️ **Sync-unsafe.** Physically remove ONE record immediately, without HLC tick / change-log entry / gossip. A peer still holding it can **resurrect** it via normal sync. Admin / non-synced contexts only — use `delete()` for replicated removal. |
+| `adapter.pruneTombstones(olderThanMs)` | `Promise<number>` | Low-level `IStorageAdapter` primitive `compact()` builds on (parallel to `pruneChanges`). Returns the count purged. |
+
+> **`hardDelete` caveat:** because it is never recorded or replicated, `hardDelete` is only correct when the record cannot come back from a peer (no sync, or a record this node alone owns). For everything synced, soft-`delete()` then let `compact()` reclaim the space.
+
+---
+
 ### Advanced: Direct HLC Access
 
 ```typescript
@@ -691,6 +726,9 @@ class MySQLiteAdapter implements IStorageAdapter {
   async delete(collection, id) { /* ... */ }
   async bulkInsert(collection, docs) { /* ... */ }
   async changes(since) { /* ... */ }
+  async pruneChanges(olderThanMs) { /* ... */ }
+  async pruneTombstones(olderThanMs) { /* physically remove aged tombstones; return count */ }
+  async getOldestChangesHlc() { /* ... */ }
   async export() { /* ... */ }
   async import(snapshot) { /* ... */ }
   async collectionNames() { /* ... */ }
