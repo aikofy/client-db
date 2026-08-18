@@ -126,8 +126,11 @@ export interface IceServer {
   credential?: string;
 }
 
+/** Static URL, or a callback invoked on every connect/reconnect (token rotation). */
+export type SignalingServer = string | (() => string | Promise<string>);
+
 export interface SyncConfig {
-  signalingServer: string;
+  signalingServer: SignalingServer;
   iceServers: IceServer[];
   nodeId?: string;
   /**

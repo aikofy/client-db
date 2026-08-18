@@ -3,6 +3,19 @@
 All notable changes to `@aikofy/client-db` are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.3.0
+
+Additive. A tab can remint its signaling token on every reconnect.
+
+### Added
+
+- **`SyncConfig.signalingServer` accepts a callback** — `string | (() => string | Promise<string>)`.
+  `_openWS` awaits it on each connect and each reconnect. A mint failure is caught and
+  schedules a reconnect instead of throwing. `reconnectAttempt` now resets on a successful
+  WebSocket `open` so a rotating client does not keep grown backoff. The `string` form is
+  unchanged.
+- The same union is accepted on `ConsumerClientConfig.signalingServerUrl`.
+
 ## 2.2.0
 
 Sync-safe disk-space reclamation. New public API, no breaking changes.

@@ -180,3 +180,48 @@ describe('WebRTCTransport — mesh sanity (refactor guard)', () => {
     b.disconnect();
   });
 });
+
+describe('WebRTCTransport — signalingServer callback', () => {
+  it('invokes a URL callback on connect and still peers', async () => {
+    installFakeWebRTC();
+    let calls = 0;
+    const a = new WebRTCTransport({
+      signalingServerUrl: () => {
+        calls += 1;
+        return 'ws://fake';
+      },
+      iceServers: [],
+      nodeId: 'A',
+      room: 'r1',
+    });
+    a.connect();
+    await tick();
+    expect(calls).toBeGreaterThanOrEqual(1);
+
+    const b = makeNormal('B');
+    b.connect();
+    await waitFor(() => a.peers().includes('B') || b.peers().includes('A'));
+    a.disconnect();
+    b.disconnect();
+  });
+
+  it('schedules a reconnect when the callback throws', async () => {
+    installFakeWebRTC();
+    let calls = 0;
+    const t = new WebRTCTransport({
+      signalingServerUrl: () => {
+        calls += 1;
+        if (calls === 1) throw new Error('mint failed');
+        return 'ws://fake';
+      },
+      iceServers: [],
+      nodeId: 'A',
+      room: 'r1',
+    });
+    t.connect();
+    await tick();
+    expect(calls).toBe(1);
+    await waitFor(() => calls >= 2, 2500);
+    t.disconnect();
+  });
+});

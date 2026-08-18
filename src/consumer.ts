@@ -17,7 +17,7 @@ import { RpcError } from './rpc/errors.js';
 import type { ClientFrame, MethodInfo, ServerFrame } from './rpc/protocol.js';
 
 export interface ConsumerClientConfig {
-  signalingServerUrl: string;
+  signalingServerUrl: string | (() => string | Promise<string>);
   /** Room = the Normal Clients' DB name. */
   room: string;
   /** Stable id for this consumer. Defaults to a random id. */
@@ -220,7 +220,19 @@ export class ConsumerClient {
   }
 
   private _openWS(): void {
-    const url = appendParams(this.cfg.signalingServerUrl, { room: this.cfg.room, nodeId: this.nodeId });
+    void this._openWSAsync();
+  }
+
+  private async _openWSAsync(): Promise<void> {
+    let raw: string;
+    try {
+      const src = this.cfg.signalingServerUrl;
+      raw = typeof src === 'function' ? await src() : src;
+    } catch (e) {
+      this.signalingReject?.(e);
+      return;
+    }
+    const url = appendParams(raw, { room: this.cfg.room, nodeId: this.nodeId });
     this.ws = new WebSocket(url);
 
     this.ws.onopen = () => {

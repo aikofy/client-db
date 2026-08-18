@@ -1,8 +1,8 @@
-import type { SyncMessage } from '../core/types.js';
+import type { SignalingServer, SyncMessage } from '../core/types.js';
 import { drainIfNeeded, BACKPRESSURE_LOW_WATER } from './backpressure.js';
 
 export interface WebRTCTransportConfig {
-  signalingServerUrl: string;
+  signalingServerUrl: SignalingServer;
   iceServers: RTCIceServer[];
   nodeId: string;
   room: string;
@@ -64,6 +64,8 @@ export class WebRTCTransport {
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
+  /** Bumps on every _openWS so an in-flight URL callback cannot open a stale socket. */
+  private openGen = 0;
   private pendingMessages = new Map<string, SyncMessage[]>();
 
   onPeerConnected: PeerEventHandler = () => undefined;
@@ -86,22 +88,39 @@ export class WebRTCTransport {
 
   private _openWS(): void {
     if (this.stopped) return;
+    const gen = ++this.openGen;
+    void this._openWSAsync(gen);
+  }
+
+  private async _openWSAsync(gen: number): Promise<void> {
+    if (this.stopped || gen !== this.openGen) return;
+
+    let raw: string;
+    try {
+      const src = this.config.signalingServerUrl;
+      raw = typeof src === 'function' ? await src() : src;
+    } catch {
+      // Mint / callback failure must schedule a reconnect, not throw out of connect().
+      if (!this.stopped && gen === this.openGen) this._scheduleReconnect();
+      return;
+    }
+    if (this.stopped || gen !== this.openGen) return;
 
     try {
-      const url = _appendParams(this.config.signalingServerUrl, {
+      const url = _appendParams(raw, {
         room: this.config.room,
         nodeId: this.config.nodeId,
       });
       this.ws = new WebSocket(url);
     } catch {
-      this._scheduleReconnect();
+      if (!this.stopped && gen === this.openGen) this._scheduleReconnect();
       return;
     }
 
     this.ws.onopen = () => {
-      // Do NOT reset the backoff here — a server that accepts then immediately
-      // closes would loop at the base delay forever. Reset only once we receive
-      // a real signaling message (proof the server is actually healthy).
+      // Reset backoff on a successful TCP/WS connect so a rotating token
+      // (callback remints on each attempt) does not keep the grown delay.
+      this.reconnectAttempt = 0;
       this.ws!.send(JSON.stringify({
         type: 'register',
         nodeId: this.config.nodeId,

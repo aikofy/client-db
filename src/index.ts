@@ -31,6 +31,7 @@ export type {
   CompactOptions,
   CompactResult,
   IceServer,
+  SignalingServer,
   SyncConfig,
   DBConfig,
   Snapshot,
